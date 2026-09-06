@@ -27,7 +27,6 @@ sources:
 queue:
   max-size: 50           # 队列最大长度
   cooldown-seconds: 10   # 点歌冷却时间(秒)
-  skip-vote-percent: 50  # 跳过投票百分比
   auto-play: true        # 当前播放完毕后自动播放下一首
   history-size: 100      # 保存的历史播放记录数量(用于"上一首"功能)
   save-on-shutdown: true # 关服时保存队列到文件

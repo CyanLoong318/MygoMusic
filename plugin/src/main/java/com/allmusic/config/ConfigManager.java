@@ -30,7 +30,6 @@ public class ConfigManager {
     // 队列配置
     private int queueMaxSize;
     private int cooldownSeconds;
-    private int skipVotePercent;
     private boolean autoPlay;
     private int historySize;
     private boolean saveOnShutdown;
@@ -86,7 +85,6 @@ public class ConfigManager {
         // 队列配置
         queueMaxSize = config.getInt("queue.max-size", 50);
         cooldownSeconds = config.getInt("queue.cooldown-seconds", 10);
-        skipVotePercent = config.getInt("queue.skip-vote-percent", 50);
         autoPlay = config.getBoolean("queue.auto-play", true);
         historySize = config.getInt("queue.history-size", 100);
         saveOnShutdown = config.getBoolean("queue.save-on-shutdown", true);
@@ -166,7 +164,6 @@ public class ConfigManager {
     public boolean isBilibiliEnabled() { return bilibiliEnabled; }
     public int getQueueMaxSize() { return queueMaxSize; }
     public int getCooldownSeconds() { return cooldownSeconds; }
-    public int getSkipVotePercent() { return skipVotePercent; }
     public boolean isAutoPlay() { return autoPlay; }
     public int getHistorySize() { return historySize; }
     public boolean isSaveOnShutdown() { return saveOnShutdown; }
