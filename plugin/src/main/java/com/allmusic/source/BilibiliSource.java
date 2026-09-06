@@ -226,6 +226,44 @@ public class BilibiliSource implements MusicSource {
         return params;
     }
 
+    /**
+     * 构建 B站「字幕列表」接口 URL。
+     * 未签名的旧接口 /x/player/v2 会被风控降级：首次请求常只回 AI 轨、漏掉人工 CC 字幕轨，
+     * 表现即"有字幕的视频第一次放拿不到歌词，第二次能拿到"。优先用 WBI 签名接口
+     * /x/player/wbi/v2（返回稳定完整的字幕轨）；密钥不可用时回退旧接口。
+     */
+    private String buildSubtitleListUrl(String bvid, String cid) {
+        String legacy = API_URL + "/x/player/v2?bvid=" + bvid + "&cid=" + cid;
+        try {
+            fetchWbiKeys();
+            if (wbiImgKey.isEmpty() || wbiSubKey.isEmpty()) {
+                logger.warn("WBI密钥不可用，字幕列表接口回退旧接口(首次请求可能被风控降级漏人工轨)");
+                return legacy;
+            }
+            Map<String, String> params = new HashMap<>();
+            params.put("bvid", bvid);
+            params.put("cid", cid);
+            params.put("wts", String.valueOf(System.currentTimeMillis() / 1000));
+
+            // 与 signParams 一致：按 key 排序、值去掉 !'()* 再 URL 编码，拼 mixin key 求 md5 得 w_rid
+            List<String> keys = new ArrayList<>(params.keySet());
+            java.util.Collections.sort(keys);
+            StringBuilder query = new StringBuilder();
+            for (int i = 0; i < keys.size(); i++) {
+                if (i > 0) query.append("&");
+                String key = keys.get(i);
+                String value = params.get(key).replaceAll("[!'()*]", "");
+                query.append(key).append("=").append(URLEncoder.encode(value, StandardCharsets.UTF_8));
+            }
+            String wRid = md5(query.toString() + getMixinKey());
+            query.append("&w_rid=").append(wRid);
+            return API_URL + "/x/player/wbi/v2?" + query;
+        } catch (Exception e) {
+            logger.warn("构建WBI字幕列表URL失败: {}, 回退旧接口", e.getMessage());
+            return legacy;
+        }
+    }
+
     @Override
     public List<SongInfo> search(String keyword, int limit) {
         List<SongInfo> results = new ArrayList<>();
@@ -641,7 +679,8 @@ public class BilibiliSource implements MusicSource {
             if (cid == null || cid.isEmpty()) return emptyLyrics();
 
             // 1. 请求字幕列表（B站字幕需登录Cookie(SESSDATA)才会返回，未登录恒为空数组）
-            String v2Url = API_URL + "/x/player/v2?bvid=" + bvid + "&cid=" + cid;
+            //    用 WBI 签名接口避免风控降级(首次请求只回AI轨漏人工CC轨)；签名不可用时自动回退旧接口
+            String v2Url = buildSubtitleListUrl(bvid, cid);
             JsonObject json = null;
             JsonObject tryJson = null;
             try {
@@ -697,6 +736,12 @@ public class BilibiliSource implements MusicSource {
             }
             String chosenUrl = manualZh != null ? manualZh : manualAny;
             if (chosenUrl == null) {
+                // 列表非空却无人工轨：可能是风控降级漏了人工 CC 轨(首次请求只回 AI 轨)。
+                // 重试一次重新拉列表拿新 URL，仍无人工轨才判定"该视频确无人工字幕"。
+                if (attempt < 2) {
+                    logger.info("B站字幕列表无人工轨，疑似风控降级(漏人工CC轨)，重试: bvid={}, 轨道数={}, 第{}次", bvid, subs.size(), attempt);
+                    return retrySubtitle(bvid, cid, durationMs, page, attempt);
+                }
                 logger.info("该分P无人工字幕(AI字幕按要求不显示): bvid={}, 字幕轨道数={}", bvid, subs.size());
                 return emptyLyrics();
             }
