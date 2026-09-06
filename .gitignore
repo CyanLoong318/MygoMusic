@@ -1,0 +1,16 @@
+# Gradle 构建产物
+.gradle/
+build/
+**/build/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 编译产物 JAR 通过 GitHub Releases 发布，不入库
+*.jar

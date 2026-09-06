@@ -1,0 +1,66 @@
+# MygoMusic 配置文件
+
+# 数据库配置
+database:
+  type: sqlite  # sqlite / mysql
+  mysql:
+    host: localhost
+    port: 3306
+    database: mygomusic
+    username: root
+    password: ""
+    pool-size: 10
+
+# 音源配置
+sources:
+  netease:
+    enabled: true
+    base-url: "https://music.163.com"
+  kugou:
+    enabled: true
+    base-url: "https://www.kugou.com"
+  bilibili:
+    enabled: true
+    base-url: "https://www.bilibili.com"
+
+# 队列配置
+queue:
+  max-size: 50           # 队列最大长度
+  cooldown-seconds: 10   # 点歌冷却时间(秒)
+  skip-vote-percent: 50  # 跳过投票百分比
+  auto-play: true        # 当前播放完毕后自动播放下一首
+  history-size: 100      # 保存的历史播放记录数量(用于"上一首"功能)
+  save-on-shutdown: true # 关服时保存队列到文件
+
+# 播放配置
+playback:
+  default-volume: 80     # 默认音量 (0-100)
+
+# 歌词配置
+lyrics:
+  enabled: true          # 是否启用歌词显示
+  show-translation: auto # auto: 中文不翻译, 外文有翻译就显示; true: 总是显示; false: 从不显示
+
+# 客户端音频缓存设置（由服务端统一下发，客户端GUI不再提供该设置）
+client-cache:
+  enabled: true          # 是否允许客户端缓存音频文件
+  max-size-mb: 512       # 客户端缓存目录上限 (MB)
+
+# HTTP 文件服务器（用于向客户端分发 B站转码后的 MP3）
+# host: 对外可达的地址/域名，拼进玩家客户端下载 MP3 的 URL。
+#   留空(默认) 时自动检测本机公网 IPv6 —— 服务器没有公网 IPv4 时，外地玩家只能通过 IPv6 下载音频。
+#   也可手动指定：公网 IPv6 "2408:xxxx::1"、DDNS 域名 "mc.example.com"、或仅内网时填局域网 IPv4。
+http-server:
+  port: 8080         # HTTP 端口；需在系统防火墙放行该端口的入站(IPv6)连接
+  host: ""           # 留空自动检测公网 IPv6
+
+# FFmpeg 配置 (用于B站视频转码)
+ffmpeg:
+  path: "ffmpeg"         # ffmpeg 可执行文件路径
+  cache-dir: "plugins/MygoMusic/cache/bilibili"  # B站转码缓存目录
+  cache-max-size: 1024   # 缓存最大大小 (MB)
+
+# 权限配置
+permissions:
+  cooldown-bypass: "mygomusic.nocooldown"  # 免冷却权限
+  queue-limit: "mygomusic.queuelimit"      # 队列优先权限

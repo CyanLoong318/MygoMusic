@@ -1,0 +1,81 @@
+name: MygoMusic
+version: '${version}'
+main: com.allmusic.AllMusicPlugin
+api-version: '1.21'
+description: 全服点歌插件 - 支持酷狗、网易云、Bilibili
+author: MygoMusicTeam
+website: https://github.com/mygomusic
+
+commands:
+  mm:
+    description: 点歌主命令
+    usage: /mm <play|playid|stop|continue|next|prev|queue|search|select|searchparts|now|volume|lyrics|login|logout|admin>
+    aliases: [music]
+
+permissions:
+  mygomusic.play:
+    description: 允许点歌
+    default: true
+  mygomusic.control:
+    description: 允许控制播放 (stop/continue/next/prev)
+    default: true
+  mygomusic.queue:
+    description: 允许查看队列
+    default: true
+  mygomusic.search:
+    description: 允许搜索歌曲
+    default: true
+  mygomusic.volume:
+    description: 允许调整音量
+    default: true
+  mygomusic.lyrics:
+    description: 允许开关歌词
+    default: true
+  mygomusic.login:
+    description: 允许登录平台账号
+    default: true
+  mygomusic.nocooldown:
+    description: 免点歌冷却
+    default: false
+  mygomusic.queuelimit:
+    description: 队列优先(可同时点更多首)
+    default: false
+  mygomusic.admin:
+    description: 管理员命令
+    default: op
+  mygomusic.admin.reload:
+    description: 重载配置
+    default: op
+  mygomusic.admin.clearqueue:
+    description: 清空队列
+    default: op
+  mygomusic.admin.skip:
+    description: 强制跳过
+    default: op
+  mygomusic.admin.prev:
+    description: 强制上一首
+    default: op
+  mygomusic.admin.stop:
+    description: 强制停止
+    default: op
+  mygomusic.admin.debug:
+    description: 调试模式
+    default: op
+  mygomusic.admin.accounts:
+    description: 查看账号状态
+    default: op
+  mygomusic.admin.sources:
+    description: 测试音源
+    default: op
+  mygomusic.admin.cache:
+    description: 管理缓存
+    default: op
+  mygomusic.admin.db:
+    description: 数据库状态
+    default: op
+  mygomusic.admin.ffmpeg:
+    description: 检查ffmpeg
+    default: op
+  mygomusic.admin.restore:
+    description: 恢复队列
+    default: op
