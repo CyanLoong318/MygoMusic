@@ -69,6 +69,10 @@ public class QueueScheduler {
      * 主循环
      */
     private void tick() {
+        // 全服暂停：不检查完成、不自动切歌（暂停时长不计入歌曲进度）
+        if (playQueue.isPaused()) {
+            return;
+        }
         if (!playQueue.isPlaying()) {
             // 没有正在播放的歌曲，尝试从队列取下一首
             if (configManager.isAutoPlay() && !playQueue.isEmpty()) {
@@ -102,6 +106,10 @@ public class QueueScheduler {
      * 与定时器完成路径一致；picking 原子锁防止二者并发重复。
      */
     public void onSongFinishedByClient() {
+        // 全服暂停期间不收“已播完”信号，避免迟到 EOF 跳歌
+        if (playQueue.isPaused()) {
+            return;
+        }
         if (playQueue.isPlaying()) {
             playQueue.stop();
         }

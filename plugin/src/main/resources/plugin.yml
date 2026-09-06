@@ -9,7 +9,7 @@ website: https://github.com/mygomusic
 commands:
   mm:
     description: 点歌主命令
-    usage: /mm <play|playid|stop|continue|next|prev|queue|search|select|searchparts|now|volume|lyrics|login|logout|admin>
+    usage: /mm <play|playid|pause|stop|continue|next|prev|remove|queue|search|select|searchparts|now|volume|lyrics|login|logout|admin>
     aliases: [music]
 
 permissions:

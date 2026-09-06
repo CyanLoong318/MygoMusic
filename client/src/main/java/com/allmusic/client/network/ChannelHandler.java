@@ -39,6 +39,8 @@ public class ChannelHandler {
     public static final byte PACKET_SONGFINISHED = 0x0C;
     // 服务端 → 客户端：客户端缓存设置（config.yml client-cache 段统一下发）
     private static final byte PACKET_CACHE_CONFIG = 0x0D;
+    // 客户端 → 服务端：请求一次队列状态同步（GUI 打开时主动拉取播放/暂停状态）
+    public static final byte PACKET_REQUEST_SYNC = 0x0E;
 
     private final AllMusicClient clientMod;
 
@@ -78,6 +80,13 @@ public class ChannelHandler {
      */
     public static void notifySongFinished() {
         sendToServer(new byte[]{PACKET_SONGFINISHED});
+    }
+
+    /**
+     * 请求一次最新的队列状态同步（播放/暂停标志 + 队列/历史）。服务端收到后回发 QUEUE_SYNC。
+     */
+    public static void requestQueueSync() {
+        sendToServer(new byte[]{PACKET_REQUEST_SYNC});
     }
 
     /**
@@ -280,6 +289,9 @@ public class ChannelHandler {
             offset += 1;
             boolean playing = readBoolean(data, offset);
             offset += 1;
+            // 注意：paused 与服务端 PluginChannel.buildQueueSyncData() 同步新增，两端需一起部署
+            boolean paused = readBoolean(data, offset);
+            offset += 1;
 
             QueueState.Song nowPlaying = null;
             if (hasCurrent) {
@@ -331,12 +343,13 @@ public class ChannelHandler {
             }
 
             final QueueState.Song finalNowPlaying = nowPlaying;
+            final boolean finalPaused = paused;
             final List<QueueState.Song> finalHistory = history;
             final List<QueueState.Song> finalQueue = queue;
 
             // 在主线程中更新快照
             client.execute(() -> {
-                QueueState.update(finalNowPlaying, playing, finalHistory, finalQueue);
+                QueueState.update(finalNowPlaying, playing, finalPaused, finalHistory, finalQueue);
                 logger.info("队列同步: 当前播放={}, 已播放 {} 首, 等待队列 {} 首",
                         finalNowPlaying == null ? "无" : finalNowPlaying.title(), finalHistory.size(), finalQueue.size());
             });

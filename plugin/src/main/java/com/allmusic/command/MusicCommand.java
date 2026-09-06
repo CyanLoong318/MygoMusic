@@ -82,11 +82,17 @@ public class MusicCommand implements CommandExecutor {
             case "playid":
                 handlePlayId(sender, args);
                 break;
+            case "pause":
+                handlePause(sender);
+                break;
             case "stop":
                 handleStop(sender);
                 break;
             case "continue":
                 handleContinue(sender);
+                break;
+            case "remove":
+                handleRemove(sender, args);
                 break;
             case "next":
                 handleNext(sender);
@@ -589,6 +595,32 @@ public class MusicCommand implements CommandExecutor {
     }
 
     /**
+     * 处理暂停（全服同步：暂停所有客户端并冻结服务端歌曲进度）
+     */
+    private void handlePause(CommandSender sender) {
+        if (!hasPermission(sender, "mygomusic.control")) {
+            MessageUtil.sendError(sender, "你没有控制播放的权限");
+            return;
+        }
+
+        if (!playQueue.isPlaying()) {
+            MessageUtil.sendWarning(sender, "当前没有正在播放的歌曲");
+            return;
+        }
+
+        playQueue.pause();
+        // 先广播暂停（让客户端本地音频立刻停），再同步 GUI 状态
+        pluginChannel.broadcastPause();
+        pluginChannel.broadcastQueueSync();
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            if (player.isOnline()) {
+                player.sendMessage("§6[MygoMusic] §e播放已暂停 (全服)，输入 §f/mm continue §e继续");
+            }
+        }
+        MessageUtil.sendSuccess(sender, "已暂停播放 (全服)");
+    }
+
+    /**
      * 处理停止播放
      */
     private void handleStop(CommandSender sender) {
@@ -607,7 +639,7 @@ public class MusicCommand implements CommandExecutor {
     }
 
     /**
-     * 处理继续播放
+     * 处理继续播放：全服暂停中 → 恢复同一首歌；否则维持原“停止后从队列继续”语义
      */
     private void handleContinue(CommandSender sender) {
         if (!hasPermission(sender, "mygomusic.control")) {
@@ -615,7 +647,58 @@ public class MusicCommand implements CommandExecutor {
             return;
         }
 
+        // 全服暂停中 → 原地恢复（不是跳到下一首）
+        if (playQueue.isPaused()) {
+            playQueue.resume();
+            pluginChannel.broadcastResume();
+            pluginChannel.broadcastQueueSync();
+            for (Player player : Bukkit.getOnlinePlayers()) {
+                if (player.isOnline()) {
+                    player.sendMessage("§6[MygoMusic] §e播放已继续 (全服)");
+                }
+            }
+            MessageUtil.sendSuccess(sender, "已继续播放");
+            return;
+        }
+
         queueScheduler.continuePlay();
+    }
+
+    /**
+     * 处理移除队列歌曲（只能移除自己点的；管理员可移除任意）
+     */
+    private void handleRemove(CommandSender sender, String[] args) {
+        if (!hasPermission(sender, "mygomusic.control")) {
+            MessageUtil.sendError(sender, "你没有控制播放的权限");
+            return;
+        }
+        if (args.length < 2) {
+            MessageUtil.sendError(sender, "用法: /mm remove <序号>");
+            return;
+        }
+        int index;
+        try {
+            index = Integer.parseInt(args[1]) - 1;
+        } catch (NumberFormatException e) {
+            MessageUtil.sendError(sender, "无效的序号");
+            return;
+        }
+        if (index < 0) {
+            MessageUtil.sendError(sender, "无效的序号");
+            return;
+        }
+
+        boolean admin = hasPermission(sender, "mygomusic.admin");
+        int result = playQueue.removeAt(index, getSenderId(sender), admin);
+        if (result == 1) {
+            MessageUtil.sendSuccess(sender, "已从队列移除该歌曲");
+            // 同步队列到客户端 GUI
+            pluginChannel.broadcastQueueSync();
+        } else if (result == -1) {
+            MessageUtil.sendError(sender, "只能移除自己点的歌");
+        } else {
+            MessageUtil.sendError(sender, "序号超出范围，当前待播放共 " + playQueue.size() + " 首");
+        }
     }
 
     /**
@@ -1149,10 +1232,11 @@ public class MusicCommand implements CommandExecutor {
         sender.sendMessage("§e/mm search <音源> <歌名> §7- 搜索歌曲");
         sender.sendMessage("§e/mm select <序号> §7- 选择搜索结果");
         sender.sendMessage("§e/mm playid <平台> <ID> [玩家] §7- 通过ID点歌");
-        sender.sendMessage("§e/mm stop §7- 停止播放");
-        sender.sendMessage("§e/mm continue §7- 继续播放");
+        sender.sendMessage("§e/mm pause §7- 暂停播放 (全服)");
+        sender.sendMessage("§e/mm continue §7- 继续播放 (全服)");
         sender.sendMessage("§e/mm next §7- 下一首");
         sender.sendMessage("§e/mm prev §7- 上一首");
+        sender.sendMessage("§e/mm remove <序号> §7- 移除自己点的歌");
         sender.sendMessage("§e/mm queue §7- 查看队列");
         sender.sendMessage("§e/mm now §7- 查看当前播放");
         sender.sendMessage("§e/mm volume <0-100> §7- 调整音量");

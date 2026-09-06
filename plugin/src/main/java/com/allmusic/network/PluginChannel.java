@@ -44,6 +44,8 @@ public class PluginChannel implements PluginMessageListener {
     public static final byte PACKET_SONGFINISHED = 0x0C;
     // 服务端 → 客户端：客户端音频缓存设置（enabled + max-size-mb，由服务端统一控制）
     public static final byte PACKET_CACHE_CONFIG = 0x0D;
+    // 客户端 → 服务端：请求一次队列状态同步（GUI 打开时主动拉取最新播放/暂停状态）
+    public static final byte PACKET_REQUEST_SYNC = 0x0E;
 
     private final AllMusicPlugin plugin;
     private final QueueScheduler queueScheduler;
@@ -72,6 +74,10 @@ public class PluginChannel implements PluginMessageListener {
                     break;
                 case PACKET_SONGFINISHED:
                     handleSongFinished(player);
+                    break;
+                case PACKET_REQUEST_SYNC:
+                    // GUI 打开时主动请求一次最新队列状态（含播放/暂停标志）
+                    sendQueueSync(player);
                     break;
                 default:
                     logger.warn("未知的包类型: {}", packetType);
@@ -141,6 +147,8 @@ public class PluginChannel implements PluginMessageListener {
             if (queueScheduler == null) return;
             PlayQueue playQueue = queueScheduler.getPlayQueue();
             if (playQueue == null || !playQueue.isPlaying()) return;
+            // 全服暂停期间忽略“已播完”信号，避免暂停时迟到 EOF 跳歌
+            if (playQueue.isPaused()) return;
             logger.info("客户端确认歌曲播放完毕(来自 {})，自动切下一首", player.getName());
             // 标记当前结束，触发下一首（picking 原子锁防止与定时器重复）
             queueScheduler.onSongFinishedByClient();
@@ -292,10 +300,12 @@ public class PluginChannel implements PluginMessageListener {
 
     /**
      * 构建队列同步数据包 (0x08):
-     * hasCurrent(1) + playing(1)
+     * hasCurrent(1) + playing(1) + paused(1)
      * + [current: songId/title/artist/source/requesterName]
      * + historySize(4) + N * [songId/title/artist/source/requesterName]   (已播放, 最近优先)
      * + queueSize(4) + M * [songId/title/artist/source/requesterName]     (等待队列)
+     *
+     * 注意：paused(1) 必须与客户端 ChannelHandler.handleQueueSync() 同步修改，两端一起部署。
      */
     private byte[] buildQueueSyncData() {
         PlayQueue playQueue = plugin.getPlayQueue();
@@ -307,6 +317,7 @@ public class PluginChannel implements PluginMessageListener {
         QueueItem current = playQueue.getCurrentPlaying();
         output.writeBoolean(current != null);
         output.writeBoolean(playQueue.isPlaying());
+        output.writeBoolean(playQueue.isPaused());
         if (current != null) {
             writeQueueItem(output, current);
         }

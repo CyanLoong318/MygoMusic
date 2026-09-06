@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Queue;
+import java.util.UUID;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -27,6 +28,11 @@ public class PlayQueue {
     private SongDetail currentSongDetail = null;
     private long playbackStartTime = 0;
     private boolean playing = false;
+
+    /** 全局暂停：暂停期间播放进度冻结（不会因时间流逝触发自动切歌/完成判定） */
+    private volatile boolean paused = false;
+    private long pausedAtMs = -1;     // 进入暂停的时刻，-1 表示未处于暂停中
+    private long totalPausedMs = 0;   // 历史累计暂停时长（不含当前这段）
 
     public PlayQueue(ConfigManager configManager) {
         this.configManager = configManager;
@@ -165,6 +171,86 @@ public class PlayQueue {
     }
 
     /**
+     * 按序号移除队列中的一首歌（序号 0 基，与 getSnapshot() 顺序一致）。
+     *
+     * @param index          等待队列内的下标
+     * @param requesterUuid  操作者 UUID（用于校验是否本人所点）
+     * @param allowAny       是否允许移除任意人点的歌（管理员）
+     * @return 1=成功移除 0=序号越界/不存在 -1=非本人所点（无权限）
+     */
+    public int removeAt(int index, UUID requesterUuid, boolean allowAny) {
+        lock.lock();
+        try {
+            if (index < 0 || index >= queue.size()) return 0;
+            QueueItem item = queue.get(index);
+            if (!allowAny && !item.getRequesterUuid().equals(requesterUuid)) return -1;
+            queue.remove(index);
+            logger.info("已从队列移除: {} (操作者: {})", item, requesterUuid);
+            return 1;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 暂停当前播放（全服同步）。幂等。
+     */
+    public void pause() {
+        lock.lock();
+        try {
+            if (paused) return;
+            paused = true;
+            pausedAtMs = System.currentTimeMillis();
+            logger.info("播放已暂停 (全服)");
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 恢复当前播放（全服同步）。幂等；把暂停时长并入累计，使有效进度冻结后继续。
+     */
+    public void resume() {
+        lock.lock();
+        try {
+            if (!paused) return;
+            long now = System.currentTimeMillis();
+            if (pausedAtMs >= 0) {
+                totalPausedMs += (now - pausedAtMs);
+            }
+            paused = false;
+            pausedAtMs = -1;
+            logger.info("播放已恢复 (全服)");
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 是否处于（全服）暂停中
+     */
+    public boolean isPaused() {
+        return paused;
+    }
+
+    /**
+     * 有效播放时长（毫秒）：扣除历史与当前暂停时段，暂停时进度保持不变
+     */
+    private long effectiveElapsedMs(long now) {
+        long elapsed = now - playbackStartTime - totalPausedMs;
+        if (paused && pausedAtMs >= 0) {
+            elapsed -= (now - pausedAtMs);
+        }
+        return Math.max(0, elapsed);
+    }
+
+    private void resetPauseState() {
+        paused = false;
+        pausedAtMs = -1;
+        totalPausedMs = 0;
+    }
+
+    /**
      * 设置当前播放歌曲
      */
     public void setCurrentPlaying(QueueItem item, SongDetail detail) {
@@ -178,6 +264,8 @@ public class PlayQueue {
             this.currentSongDetail = detail;
             this.playbackStartTime = System.currentTimeMillis();
             this.playing = true;
+            // 新歌开始 → 解除暂停（切歌即“继续播放新歌”）
+            resetPauseState();
         } finally {
             lock.unlock();
         }
@@ -214,6 +302,7 @@ public class PlayQueue {
         lock.lock();
         try {
             this.playing = false;
+            resetPauseState();
             logger.info("播放已停止");
         } finally {
             lock.unlock();
@@ -233,7 +322,7 @@ public class PlayQueue {
     }
 
     /**
-     * 获取当前播放进度 (毫秒)
+     * 获取当前播放进度 (毫秒)，扣除暂停时间（暂停时进度保持冻结）
      */
     public long getPlaybackPosition() {
         lock.lock();
@@ -241,14 +330,14 @@ public class PlayQueue {
             if (!playing || currentSongDetail == null) {
                 return 0;
             }
-            return System.currentTimeMillis() - playbackStartTime;
+            return effectiveElapsedMs(System.currentTimeMillis());
         } finally {
             lock.unlock();
         }
     }
 
     /**
-     * 检查歌曲是否播放完毕
+     * 检查歌曲是否播放完毕（基于有效播放时长，暂停期间不会“到点”）
      */
     public boolean isPlaybackFinished() {
         lock.lock();
@@ -256,7 +345,7 @@ public class PlayQueue {
             if (!playing || currentSongDetail == null) {
                 return false;
             }
-            long position = System.currentTimeMillis() - playbackStartTime;
+            long position = effectiveElapsedMs(System.currentTimeMillis());
             return position >= currentSongDetail.getDuration();
         } finally {
             lock.unlock();

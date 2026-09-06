@@ -3,6 +3,7 @@ package com.allmusic.client.gui;
 import com.allmusic.client.AllMusicClient;
 import com.allmusic.client.audio.AudioPlayer;
 import com.allmusic.client.config.ClientConfig;
+import com.allmusic.client.network.ChannelHandler;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
@@ -19,6 +20,8 @@ public class MainScreen extends Screen {
 
     private final Screen parent;
     private final ClientConfig config;
+    /** 暂停/继续按钮：根据服务端队列状态决定文案与命令 */
+    private ButtonWidget pauseButton;
 
     public MainScreen(Screen parent, ClientConfig config) {
         super(Text.of("MygoMusic"));
@@ -60,13 +63,17 @@ public class MainScreen extends Screen {
         int controlY = startY + (btnHeight + gap) * 3 + 10;
         AudioPlayer audioPlayer = AllMusicClient.getInstance().getAudioPlayer();
 
-        this.addDrawableChild(ButtonWidget.builder(Text.of("§c暂停/继续"), button -> {
-            if (audioPlayer.isPlaying()) {
-                audioPlayer.pause();
+        // 暂停/继续：改为全服同步，由服务端 mm pause / mm continue 统一处理。
+        // 按钮文案在 render() 里根据 QueueState 实时刷新（正在播放→暂停；已暂停/未播放→继续）。
+        this.pauseButton = ButtonWidget.builder(Text.of("§c暂停"), button -> {
+            QueueState q = QueueState.get();
+            if (q.isPlaying() && !q.isPaused()) {
+                sendCommand("mm pause");
             } else {
-                audioPlayer.resume();
+                sendCommand("mm continue");
             }
-        }).dimensions(centerX - btnWidth / 2 - 62, controlY, 60, 20).build());
+        }).dimensions(centerX - btnWidth / 2 - 62, controlY, 60, 20).build();
+        this.addDrawableChild(this.pauseButton);
 
         this.addDrawableChild(ButtonWidget.builder(Text.of("§e上一首"), button -> {
             sendCommand("mm prev");
@@ -108,6 +115,9 @@ public class MainScreen extends Screen {
         // 关闭按钮
         this.addDrawableChild(ButtonWidget.builder(Text.of("§7关闭"), button -> close())
                 .dimensions(centerX - 25, controlY + 50, 50, 20).build());
+
+        // 主动拉取一次服务端播放/暂停状态，保证「暂停/继续」按钮文案不过期
+        ChannelHandler.requestQueueSync();
     }
 
     private void sendCommand(String command) {
@@ -131,17 +141,26 @@ public class MainScreen extends Screen {
 
         // 当前播放信息（标题下方，按钮上方）
         AudioPlayer audioPlayer = AllMusicClient.getInstance().getAudioPlayer();
+        QueueState queueState = QueueState.get();
         int infoY = 38;
         if (audioPlayer.isPlaying()) {
             String title = audioPlayer.getCurrentTitle();
             String artist = audioPlayer.getCurrentArtist();
+            String prefix = queueState.isPaused() ? "§c已暂停: §f" : "§e正在播放: §f";
             context.drawCenteredTextWithShadow(this.textRenderer,
-                    Text.of("§e正在播放: §f" + title), centerX, infoY, 0xFFFFFF);
+                    Text.of(prefix + title), centerX, infoY, 0xFFFFFF);
             context.drawCenteredTextWithShadow(this.textRenderer,
                     Text.of("§7歌手: §f" + artist), centerX, infoY + 12, 0xAAAAAA);
         } else {
             context.drawCenteredTextWithShadow(this.textRenderer,
                     Text.of("§7当前没有正在播放"), centerX, infoY, 0xAAAAAA);
+        }
+
+        // 按服务端队列状态刷新「暂停/继续」按钮文案
+        // 正在播放且未暂停 → 暂停；否则（已暂停或未播放）→ 继续
+        if (this.pauseButton != null) {
+            boolean playable = queueState.isPlaying() && !queueState.isPaused();
+            this.pauseButton.setMessage(Text.of(playable ? "§c暂停" : "§a继续"));
         }
     }
 
