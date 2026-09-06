@@ -37,14 +37,14 @@
 
 | 文件 | 用途 |
 |------|------|
-| `MygoMusic-1.0.0-mc1.21.4.jar` | 服务端插件，放入服务器 `plugins/` |
-| `MygoMusic-Client-1.0.0-mc1.21.4.jar` | 客户端 Mod，放入 `mods/` |
+| `MygoMusic-1.0.1-mc1.21.4.jar` | 服务端插件，放入服务器 `plugins/` |
+| `MygoMusic-Client-1.0.1-mc1.21.4.jar` | 客户端 Mod，放入 `mods/` |
 
 ## 🚀 快速开始
 
 ### 服务端（Spigot/Paper/Leaves）
 
-1. 下载 `MygoMusic-1.0.0-mc1.21.4.jar` 放入服务器 `plugins/` 文件夹
+1. 下载 `MygoMusic-1.0.1-mc1.21.4.jar` 放入服务器 `plugins/` 文件夹
 2. 重启服务器，生成 `plugins/MygoMusic/config.yml`
 3. 编辑配置（音源开关、端口、ffmpeg 路径等），再次重启
 4. 服务端需安装 **ffmpeg**（用于 B站转码，见下文）
@@ -52,7 +52,7 @@
 ### 客户端（Fabric）
 
 1. 安装 [Fabric Loader](https://fabricmc.net/) 与 [Fabric API](https://modrinth.com/mod/fabric-api)
-2. 下载 `MygoMusic-Client-1.0.0-mc1.21.4.jar` 放入客户端 `mods/` 文件夹
+2. 下载 `MygoMusic-Client-1.0.1-mc1.21.4.jar` 放入客户端 `mods/` 文件夹
 3. 加入安装了插件的服务器，进入游戏
 
 ### 验证
@@ -244,10 +244,10 @@ ffmpeg:
 # 构建全部两个模块
 gradle build
 
-# 仅服务端插件 → plugin/build/libs/MygoMusic-1.0.0.jar
+# 仅服务端插件 → plugin/build/libs/MygoMusic-1.0.1.jar
 gradle :plugin:build
 
-# 仅客户端 Mod → client/build/libs/MygoMusic-Client-1.0.0.jar
+# 仅客户端 Mod → client/build/libs/MygoMusic-Client-1.0.1.jar
 gradle :client:build
 ```
 
@@ -289,6 +289,14 @@ mygomusic/
 | 客户端 | Fabric Loader 0.16+、Fabric API、Minecraft **1.21.4**、Java 21 |
 
 ## 📜 更新日志
+
+### v1.0.1
+- 🐛 修复「暂停 → 继续」无法续播的问题：改为**全服同步暂停**（`/mm pause` / 主界面「暂停/继续」按钮），继续后从**断点精确续播**，进度不因暂停时长跳变，暂停期间不会静默快进或提前切歌
+- 🐛 修复暂停状态下无法切上一首 / 下一首的问题（客户端播放线程代际失效保护）
+- 🖥️ 搜索界面结果改为**按钮行**展示（点击即点歌，支持 B站多分P 选择与长列表翻页）
+- 🖥️ 播放队列 / 最近播放改为**按钮行**：带全局序号 `#N`（与 `/mm remove` 一致）与翻页，点击即可移除 / 重新点歌
+- ✨ 新增命令 `/mm remove <序号>`：从等待队列移除自己点的歌（管理员可移任意）
+- 📋 服务端 QUEUE_SYNC 同步暂停状态；客户端新增请求状态包，GUI 状态实时刷新
 
 ### v1.0.0
 - 初始版本
