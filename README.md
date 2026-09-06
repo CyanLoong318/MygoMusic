@@ -5,6 +5,17 @@
 
 > 🤖 **AI 编写声明：本项目代码由 AI（Claude）编写**，人类仅负责需求与测试。代码可能存在设计局限或未发现的 Bug，请谨慎用于生产环境，欢迎提交 Issue 反馈问题。
 
+## 🙏 鸣谢
+
+本项目的创意与部分设计参考了 **zmusic**（MC Java 版全服音乐 / 点歌）项目，感谢其原作者 **zhenxin**。
+
+在此一并感谢 **Fluorine_Arrow**、**ZMIBPZF**。
+
+## 📄 免责声明
+
+- 本项目仅供学习交流，请遵守各音乐平台的服务条款与相关法律法规，勿用于商业用途。
+- 本项目代码由 AI 编写，可能存在 Bug 或安全缺陷，使用风险自负。
+
 ## ✨ 功能特性
 
 - 🎵 **三大音源**：酷狗音乐、网易云音乐、Bilibili（支持 BV 号直达、多分P 选择）
@@ -21,14 +32,12 @@
 
 ## 📦 下载
 
-在 **[GitHub Releases](https://github.com/CyanLoong318/zmusic/releases)** 页面下载（适用 **Minecraft 1.21.4**）：
+在 **[GitHub Releases](https://github.com/CyanLoong318/MygoMusic/releases)** 页面下载（适用 **Minecraft 1.21.4**）：
 
 | 文件 | 用途 |
 |------|------|
 | `MygoMusic-1.0.0-mc1.21.4.jar` | 服务端插件，放入服务器 `plugins/` |
 | `MygoMusic-Client-1.0.0-mc1.21.4.jar` | 客户端 Mod，放入 `mods/` |
-
-> 注：仓库名沿用旧项目名 `zmusic`，本发布内容是 MygoMusic 全服点歌系统。
 
 ## 🚀 快速开始
 
@@ -285,14 +294,3 @@ mygomusic/
 - PlaceholderAPI 扩展
 - 服务端统一管理客户端音频缓存
 - HTTP 服务分发 B站转码音频，支持公网 IPv6 自动检测
-
-## 🙏 鸣谢
-
-本项目的创意与部分设计参考了 **zmusic**（MC Java 版全服音乐 / 点歌）项目，感谢其原作者 **zhenxin**。
-
-在此一并感谢 **Fluorine_Arrow**、**ZMIBPZF**。
-
-## 📄 免责声明
-
-- 本项目仅供学习交流，请遵守各音乐平台的服务条款与相关法律法规，勿用于商业用途。
-- 本项目代码由 AI 编写，可能存在 Bug 或安全缺陷，使用风险自负。
