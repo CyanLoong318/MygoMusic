@@ -8,6 +8,7 @@
 ## 🙏 鸣谢
 
 本项目的创意与部分设计参考了 **zmusic**（MC Java 版全服音乐 / 点歌）项目，感谢其原作者 **zhenxin**。
+https://github.com/starhui-dev/zmusic-plugin
 
 在此一并感谢 **Fluorine_Arrow**、**ZMIBPZF**。
 
