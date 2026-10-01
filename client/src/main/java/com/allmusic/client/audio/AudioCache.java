@@ -5,6 +5,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.LinkedHashMap;
@@ -12,6 +13,10 @@ import java.util.Map;
 
 /**
  * 音频缓存
+ *
+ * 缓存键 = URL 的「稳定形式」（见 normalizeUrl）：
+ * B站直链每次解析出来的域名镜像、时效参数(e=/deadline=)都会变，若直接拿整条 URL 做键，
+ * 同一首歌每次播放都会重新下载。故对B站CDN链接只取路径做键。
  */
 public class AudioCache {
     private static final Logger logger = LoggerFactory.getLogger("MygoMusic-Cache");
@@ -36,10 +41,10 @@ public class AudioCache {
      * 获取缓存文件
      */
     public File get(String url) {
-        String hash = hashUrl(url);
-        File file = new File(cacheDir, hash + ".mp3");
+        if (url == null || url.isEmpty()) return null;
+        File file = new File(cacheDir, hashUrl(url) + ".mp3");
 
-        if (file.exists()) {
+        if (file.exists() && file.length() > 0) {
             // 更新访问时间
             file.setLastModified(System.currentTimeMillis());
             return file;
@@ -67,6 +72,79 @@ public class AudioCache {
         cleanCache();
 
         return file;
+    }
+
+    /**
+     * 创建「边下边写」的缓存写入器：下载的同时落盘，播放到自然结束才 commit。
+     * 中途切歌/停止则 abort —— 这样缓存目录里不会留下半截的、放不出声的坏文件。
+     */
+    public CacheWriter writer(String url) {
+        if (!enabled || url == null || url.isEmpty()) return null;
+        try {
+            return new CacheWriter(new File(cacheDir, hashUrl(url) + ".mp3"));
+        } catch (IOException e) {
+            logger.warn("创建缓存写入器失败: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * 边下载边写缓存的写入器。先写 .part 临时文件，全部下完后原子改名成正式缓存文件。
+     */
+    public class CacheWriter {
+        private final File partFile;
+        private final File finalFile;
+        private final OutputStream out;
+        private boolean closed = false;
+
+        private CacheWriter(File finalFile) throws IOException {
+            this.finalFile = finalFile;
+            this.partFile = new File(finalFile.getParentFile(), finalFile.getName() + ".part");
+            this.out = new BufferedOutputStream(new FileOutputStream(partFile), 64 * 1024);
+        }
+
+        /** 写入一块刚下载到的数据（由下载线程调用） */
+        public synchronized void write(byte[] buf, int off, int len) {
+            if (closed || len <= 0) return;
+            try {
+                out.write(buf, off, len);
+            } catch (IOException e) {
+                logger.warn("写缓存失败: {}", e.getMessage());
+            }
+        }
+
+        /** 下载完整：落盘并让缓存生效 */
+        public synchronized void commit() {
+            if (closed) return;
+            closed = true;
+            try {
+                out.close();
+                if (partFile.length() > 0) {
+                    if (finalFile.exists()) finalFile.delete();
+                    if (!partFile.renameTo(finalFile)) {
+                        logger.warn("缓存改名失败: {}", finalFile.getName());
+                        partFile.delete();
+                    } else {
+                        cleanCache();
+                    }
+                } else {
+                    partFile.delete();
+                }
+            } catch (IOException e) {
+                logger.warn("缓存落盘失败: {}", e.getMessage());
+                partFile.delete();
+            }
+        }
+
+        /** 中途停止：丢弃半截文件 */
+        public synchronized void abort() {
+            if (closed) return;
+            closed = true;
+            try {
+                out.close();
+            } catch (IOException ignored) {}
+            partFile.delete();
+        }
     }
 
     /**
@@ -129,19 +207,61 @@ public class AudioCache {
     }
 
     /**
+     * URL 的稳定形式（缓存键）
+     */
+    private String normalizeUrl(String url) {
+        // 直链字段可能是多候选（\n 分隔），第一条即主链
+        int nl = url.indexOf('\n');
+        if (nl >= 0) url = url.substring(0, nl);
+
+        if (isBilibiliCdn(url)) {
+            try {
+                String path = new URI(url).getPath();
+                if (path != null && !path.isEmpty()) {
+                    return "bili:" + path;
+                }
+            } catch (Exception ignored) {
+                // 解析失败就退回原串
+            }
+        }
+        return url;
+    }
+
+    /**
+     * 是否B站CDN直链（域名会轮换、带时效参数，必须用路径做键）
+     */
+    private static boolean isBilibiliCdn(String url) {
+        try {
+            URI u = new URI(url);
+            String host = u.getHost();
+            if (host == null) return false;
+            host = host.toLowerCase();
+            if (host.endsWith("bilivideo.com") || host.endsWith("bilivideo.cn")
+                    || host.endsWith("hdslb.com")) {
+                return true;
+            }
+            // B站也会下发 akamaized.net 镜像，靠路径特征区分
+            String path = u.getPath();
+            return host.endsWith("akamaized.net") && path != null && path.startsWith("/upgcxcode/");
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
      * URL 哈希
      */
     private String hashUrl(String url) {
         try {
             MessageDigest md = MessageDigest.getInstance("MD5");
-            byte[] hash = md.digest(url.getBytes(StandardCharsets.UTF_8));
+            byte[] hash = md.digest(normalizeUrl(url).getBytes(StandardCharsets.UTF_8));
             StringBuilder sb = new StringBuilder();
             for (byte b : hash) {
                 sb.append(String.format("%02x", b));
             }
             return sb.toString();
         } catch (Exception e) {
-            return String.valueOf(url.hashCode());
+            return String.valueOf(normalizeUrl(url).hashCode());
         }
     }
 

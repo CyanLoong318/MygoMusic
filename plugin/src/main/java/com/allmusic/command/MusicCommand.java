@@ -1167,13 +1167,18 @@ public class MusicCommand implements CommandExecutor {
 
     private void handleAdminSources(CommandSender sender) {
         sender.sendMessage("§6========== [MygoMusic 音源状态] ==========");
-        Map<String, boolean[]> results = sourceManager.testAllSources();
-        for (Map.Entry<String, boolean[]> entry : results.entrySet()) {
-            String status = entry.getValue()[0] ? "§a可用" : "§c不可用";
-            String login = entry.getValue()[1] ? "§a已登录" : "§e未登录";
-            sender.sendMessage(String.format("§e%s: %s §7(%s)", entry.getKey(), status, login));
-        }
-        sender.sendMessage("§6========================================");
+        // 逐音源真实发网络请求，必须异步：跑在主线程会冻结整个服务端（含队列调度 tick）数分钟
+        Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            Map<String, boolean[]> results = sourceManager.testAllSources();
+            Bukkit.getScheduler().runTask(plugin, () -> {
+                for (Map.Entry<String, boolean[]> entry : results.entrySet()) {
+                    String status = entry.getValue()[0] ? "§a可用" : "§c不可用";
+                    String login = entry.getValue()[1] ? "§a已登录" : "§e未登录";
+                    sender.sendMessage(String.format("§e%s: %s §7(%s)", entry.getKey(), status, login));
+                }
+                sender.sendMessage("§6========================================");
+            });
+        });
     }
 
     private void handleAdminCache(CommandSender sender, String[] args) {

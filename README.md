@@ -10,6 +10,9 @@
 本项目的创意与部分设计参考了 **zmusic**（MC Java 版全服音乐 / 点歌）项目，感谢其原作者 **zhenxin**。
 https://github.com/starhui-dev/zmusic-plugin
 
+B站音频直链解析的实现参考了 **FrecklyComb1728** 的 **BiliParser**（`biliparser`，零依赖的B站直链解析 CLI）中 WBI 签名与音轨选择的思路，特此致谢。
+https://github.com/FrecklyComb1728/BiliParser
+
 在此一并感谢 **Fluorine_Arrow**、**ZMIBPZF**。
 
 ## 📄 免责声明
@@ -40,7 +43,7 @@ https://github.com/starhui-dev/zmusic-plugin
 - 🗄️ **数据库**：SQLite / MySQL 可选，记录播放历史
 - 📊 **PlaceholderAPI**：支持 `%mygomusic_*%` 变量扩展
 - ☁️ **服务端统一缓存管理**：客户端音频缓存开关与上限由服务端 `config.yml` 统一下发
-- 🌐 **B站音频分发**：服务端将 B站视频用 ffmpeg 转码为 MP3 后，通过内置 HTTP 服务分发给玩家客户端
+- 🌐 **B站直链播放**：服务端解析出 B站 CDN 的音频直链下发给客户端，客户端**直接从 B站拉流播放**（无需 ffmpeg、不占服务器上行带宽）；旧方案「服务端 ffmpeg 转码 MP3 + 内置 HTTP 分发」保留为可选兼容模式（`play-mode: transcode`）
 
 ## 📦 下载
 
@@ -48,28 +51,30 @@ https://github.com/starhui-dev/zmusic-plugin
 
 | 文件 | 用途 |
 |------|------|
-| `MygoMusic-1.0.1-mc1.21.4.jar` | 服务端插件，放入服务器 `plugins/` |
-| `MygoMusic-Client-1.0.1-mc1.21.4.jar` | 客户端 Mod，放入 `mods/` |
+| `MygoMusic-1.0.2-mc1.21.4.jar` | 服务端插件，放入服务器 `plugins/` |
+| `MygoMusic-Client-1.0.2-mc1.21.4.jar` | 客户端 Mod，放入 `mods/` |
+
+> ⚠️ **v1.0.2 升级必读**：B站音频改为**直链播放**，解码在客户端完成。**插件与 Mod 必须同时升级**——旧版客户端解不了 B站的 m4s(AAC) 音轨，只能用新版 Mod；若暂时无法升级全部客户端，可先把服务端 `sources.bilibili.play-mode` 设为 `transcode` 用回旧方案。
 
 ## 🚀 快速开始
 
 ### 服务端（Spigot/Paper/Leaves）
 
-1. 下载 `MygoMusic-1.0.1-mc1.21.4.jar` 放入服务器 `plugins/` 文件夹
+1. 下载 `MygoMusic-1.0.2-mc1.21.4.jar` 放入服务器 `plugins/` 文件夹
 2. 重启服务器，生成 `plugins/MygoMusic/config.yml`
-3. 编辑配置（音源开关、端口、ffmpeg 路径等），再次重启
-4. 服务端需安装 **ffmpeg**（用于 B站转码，见下文）
+3. 编辑配置（音源开关、端口等），再次重启
+4. 默认的 B站直链播放**不需要 ffmpeg**；只有把 `play-mode` 设为 `transcode`（旧方案）时才需要
 
 ### 客户端（Fabric）
 
 1. 安装 [Fabric Loader](https://fabricmc.net/) 与 [Fabric API](https://modrinth.com/mod/fabric-api)
-2. 下载 `MygoMusic-Client-1.0.1-mc1.21.4.jar` 放入客户端 `mods/` 文件夹
+2. 下载 `MygoMusic-Client-1.0.2-mc1.21.4.jar` 放入客户端 `mods/` 文件夹
 3. 加入安装了插件的服务器，进入游戏
 
 ### 验证
 
 - 服务器控制台出现 `MygoMusic 启动成功!`
-- 游戏中按 `M` 打开主界面，搜索并点一首酷狗/网易云歌 → 全服同时播放；点 B站视频 → 服务端转码 MP3 后分发
+- 游戏中按 `M` 打开主界面，搜索并点一首酷狗/网易云歌 → 全服同时播放；点 B站视频 → 客户端直接从 B站 CDN 拉流播放
 
 ## 📖 使用说明
 
@@ -155,6 +160,8 @@ sources:
     enabled: true
   bilibili:
     enabled: true
+    play-mode: direct      # direct=下发B站直链给客户端播放（推荐，需 v1.0.2+ 客户端）
+                           # transcode=服务端 ffmpeg 转码 MP3 + 内置HTTP分发（旧方案，需 ffmpeg）
 
 # 队列
 queue:
@@ -178,20 +185,21 @@ client-cache:
   enabled: true              # 是否允许客户端缓存音频
   max-size-mb: 512           # 缓存上限 (MB)
 
-# HTTP 文件服务器（用于向客户端分发 B站转码后的 MP3）
+# HTTP 文件服务器（仅 transcode 模式使用：向客户端分发 B站转码后的 MP3）
 http-server:
   port: 8080
   host: ""                   # 留空自动检测本机公网 IPv6；无公网 IPv4 时外地玩家靠 IPv6 下载
 
-# FFmpeg（B站视频转码）
+# FFmpeg（仅 transcode 模式使用：B站视频转码）
 ffmpeg:
   path: "ffmpeg"
   cache-dir: "plugins/MygoMusic/cache/bilibili"
   cache-max-size: 1024
 ```
 
-> 💡 **关于 `http-server.host`（无公网 IPv4 玩家的必读项）**
+> 💡 **关于 `http-server.host`（仅 `play-mode: transcode` 需要）**
 > 服务器没有公网 IPv4、只有公网 IPv6 时，B站歌曲转码后的 MP3 由服务端内置 HTTP 服务提供。默认 `host` 留空会**自动检测本机公网 IPv6** 并拼进下发给客户端的下载地址；也可手动指定公网 IPv6、DDNS 域名或局域网 IPv4。记得在系统防火墙放行对应端口的入站连接。
+> 用默认的 `direct` 直链模式时不需要这个 HTTP 服务，也不需要 ffmpeg。
 
 ### 客户端 `config/allmusic-client.json`
 
@@ -242,7 +250,11 @@ ffmpeg:
 
 - **酷狗音乐**：VIP/版权曲目需要"酷狗官网已登录 VIP 账号"的 Cookie（`/mm login kugou <cookie>`）；无有效 Cookie 无法绕过版权。
 - **网易云音乐**：普通曲目可直接播放；VIP 曲目需登录。
-- **Bilibili**：视频音频通过服务端 **ffmpeg 转码为 MP3** 后分发给玩家（缓存于 `plugins/MygoMusic/cache/bilibili/`）。
+- **Bilibili**：服务端解析出 B站 CDN 的**音频直链**下发给客户端，客户端直接从 B站拉流解码播放（默认 `play-mode: direct`）。
+  - 走的是 B站 DASH 音轨（m4s 容器里的 **AAC-LC**），客户端内置解码器解码；只挑 AAC-LC，**HE-AAC（SBR）/ 杜比 / Hi-Res 音轨会自动回退到服务端 ffmpeg 转码**（这类视频若服务端没装 ffmpeg 就会失败，属已知限制）。
+  - 直链带时效签名、CDN 会轮换镜像，所以**每次播放前都重新解析**；客户端按 URL 路径（而非整条带签名的 URL）做缓存键，同一首歌不会因换镜像重复下载。
+  - 拉流支持**断线续传**（Range）、**边下边播**（预读缓冲）与**边听边缓存**；缓存目录为客户端 `allmusic/cache/`。
+  - `play-mode: transcode` 时退回旧方案：服务端 ffmpeg 转码为 MP3（缓存于 `plugins/MygoMusic/cache/bilibili/`），经内置 HTTP 服务分发。
   - 歌词取**人工 CC 字幕**（仅当字幕为中文优先的 CC 字幕时）；纯 AI 字幕的视频无歌词属预期。B站字幕接口需要登录 Cookie（含 `SESSDATA`）。
   - 支持 BV 号直达与多分P 选择，音频/字幕/时长按分P 独立缓存。
 - 登录 Cookie 保存在服务端 `plugins/MygoMusic/cookies.yml`，**重启自动恢复**。
@@ -255,10 +267,10 @@ ffmpeg:
 # 构建全部两个模块
 gradle build
 
-# 仅服务端插件 → plugin/build/libs/MygoMusic-1.0.1.jar
+# 仅服务端插件 → plugin/build/libs/MygoMusic-1.0.2.jar
 gradle :plugin:build
 
-# 仅客户端 Mod → client/build/libs/MygoMusic-Client-1.0.1.jar
+# 仅客户端 Mod → client/build/libs/MygoMusic-Client-1.0.2.jar
 gradle :client:build
 ```
 
@@ -296,10 +308,26 @@ mygomusic/
 
 | 环境 | 要求 |
 |------|------|
-| 服务端 | Spigot / Paper / Leaves **1.21.4**、Java 21、ffmpeg（B站转码）、PlaceholderAPI（可选） |
+| 服务端 | Spigot / Paper / Leaves **1.21.4**、Java 21、PlaceholderAPI（可选）、ffmpeg（仅 `play-mode: transcode` 需要） |
 | 客户端 | Fabric Loader 0.16+、Fabric API、Minecraft **1.21.4**、Java 21 |
 
 ## 📜 更新日志
+
+### v1.0.2
+- 🌐 **B站音频改为直链播放**：服务端只解析 B站 CDN 的 DASH 音频直链（WBI 签名 `/x/player/wbi/playurl`，失败自动回退旧接口）下发给客户端，客户端**直接从 B站拉流解码**——不再需要 ffmpeg、不再占用服务器上行带宽、外地玩家也不再受服务器公网地址/端口影响
+  - 客户端新增 **AAC 解码器（JAAD）+ 流式 fMP4(m4s) 解析**：边下边播、只在小盒子上做内存解析，长视频（实测 1 小时）也不占内存
+  - 新增**断线续传**（按已下载字节发 Range 请求，多 CDN 候选自动换链）与**边听边缓存**（下完整首才落盘，半截文件不留缓存）
+  - 缓存键改用 URL 的稳定形式（B站链接只取路径）：直链的 `e=`/`deadline=` 时效参数与 CDN 镜像轮换不再导致重复下载
+  - 只下发客户端能解的 **AAC-LC** 音轨；HE-AAC(SBR)/杜比/Hi-Res 自动回退服务端 ffmpeg 转码
+  - 旧方案保留为 `sources.bilibili.play-mode: transcode`（**插件与 Mod 需同时升级**，详见下载页说明）
+- ⚠️ 兼容性：协议新增 `source` 字段的用法与播放链路，v1.0.1 及更早的客户端无法播放 B站音频
+- 🐛 **修复「长音频转码卡满 5 分钟、整支队列跟着停摆」**：ffmpeg 的进度输出此前从未被读取，写满 Windows 管道缓冲区（约 4KB）后进程永久阻塞在 write 上，只能等 `waitFor(300s)` 超时判失败；同时该次取歌一直占着队列的取歌锁，导致期间**任何新点的歌、`/mm continue`、`/mm next` 全部无效**。实测 1 小时音频：修复前卡满 300 秒失败，修复后 **43 秒转码成功**
+  - FfmpegUtil 改为**边跑边排空子进程输出**，超时 `destroyForcibly()` 不再留孤儿 ffmpeg，失败日志带上 ffmpeg 的退出码与输出末尾
+  - `QueueScheduler` 新增**取歌看门狗 + 代次号**：任何一次取歌卡住都会在超时后被放弃并自动跳下一首，迟到的结果不会劫持已经切走的播放；`/mm next` 现在也能取消在途取歌
+  - 服务端下载 B站音频补齐**整体超时 + Content-Length 校验 + `.part` 原子改名**，CDN 提前掐断的半截文件不再流进转码
+  - 所有音源 API 调用加**整体调用超时**（45s），CDN 慢速滴流不再能无限期挂住取歌
+  - 新增配置：`queue.fetch-timeout-seconds`(60) / `queue.transcode-fetch-timeout-seconds`(900) / `sources.bilibili.download-timeout-seconds`(300) / `ffmpeg.timeout-seconds`(300)，均可用 0 或负数关闭
+- 🐛 修复 `/mm admin sources` 在主线程逐音源发网络请求、可冻结整个服务端数分钟的问题（改为异步）
 
 ### v1.0.1
 - 🐛 修复「暂停 → 继续」无法续播的问题：改为**全服同步暂停**（`/mm pause` / 主界面「暂停/继续」按钮），继续后从**断点精确续播**，进度不因暂停时长跳变，暂停期间不会静默快进或提前切歌

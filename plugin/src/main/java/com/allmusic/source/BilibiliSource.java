@@ -18,8 +18,10 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -41,6 +43,19 @@ public class BilibiliSource implements MusicSource {
     // 因此首次成功取到的字幕缓存复用，避免队列播放时重新请求导致"拿到了却没歌词"。
     private final java.util.concurrent.ConcurrentHashMap<String, Lyrics> subtitleCache =
             new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * 正在执行「服务端下载 / 转码」的取歌数量（>0 = 慢路径）。
+     * 队列看门狗据此放宽超时：direct 模式下没有 AAC-LC 音轨的视频会自动回退到转码，
+     * 那条路本来就慢，不能被直链模式的短超时误杀。
+     */
+    private final java.util.concurrent.atomic.AtomicInteger slowPathOperations =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    @Override
+    public boolean isInSlowPath() {
+        return slowPathOperations.get() > 0;
+    }
 
     // WBI签名相关
     private String wbiImgKey = "";
@@ -492,6 +507,16 @@ public class BilibiliSource implements MusicSource {
             }
             logger.debug("获取到CID: bvid={}, cid={}", bvid, cid);
 
+            // 直链模式（默认）：解析出B站CDN音频直链下发给客户端，客户端自行拉流播放
+            // （无需ffmpeg、不占用服务器上行带宽、外地玩家也不受服务器公网地址限制）
+            if (!"transcode".equalsIgnoreCase(configManager.getBilibiliPlayMode())) {
+                String direct = resolveDirectAudioUrls(bvid, cid);
+                if (direct != null && !direct.isEmpty()) {
+                    return direct;
+                }
+                logger.warn("B站直链解析失败，回退到服务端转码方案: bvid={}, cid={}", bvid, cid);
+            }
+
             // 获取音频流地址
             String url = API_URL + "/x/player/playurl?bvid=" + bvid + "&cid=" + cid + "&fnval=16";
             Map<String, String> headers = getAntiScrapingHeaders();
@@ -546,6 +571,186 @@ public class BilibiliSource implements MusicSource {
             logger.error("获取音频URL失败: " + e.getMessage(), e);
         }
         return null;
+    }
+
+    /**
+     * 解析B站音频直链（DASH 音轨），返回可直接播放的 CDN 地址。
+     * 多条候选（主链 + 备用CDN）用 '\n' 分隔，客户端按顺序重试。
+     *
+     * 要点：
+     *  - 优先走 WBI 签名的 /x/player/wbi/playurl（与 cli/bili.js 同款），失败回退未签名接口；
+     *  - 只在「实际下发的流」里挑音轨，不信任 accept_quality（未登录时它会谎报）；
+     *  - 只挑 AAC 音轨（codecs 以 mp4a 开头）：杜比(ec-3)/Hi-Res(fLaC) 客户端解不了，必须跳过；
+     *  - 直链带 e=/deadline= 时效参数，过期即 403；每次播放前都会重新解析，故无需缓存直链。
+     */
+    private String resolveDirectAudioUrls(String bvid, String cid) {
+        try {
+            JsonObject data = requestPlayUrlData(bvid, cid);
+            if (data == null) return null;
+
+            if (!data.has("dash") || !data.get("dash").isJsonObject()) {
+                logger.warn("playurl 未返回 DASH 流: bvid={}, cid={}", bvid, cid);
+                return null;
+            }
+            JsonObject dash = data.getAsJsonObject("dash");
+            JsonArray audioArray = dash.has("audio") && dash.get("audio").isJsonArray()
+                    ? dash.getAsJsonArray("audio") : null;
+            if (audioArray == null || audioArray.size() == 0) {
+                logger.warn("DASH 中没有音轨: bvid={}, cid={}", bvid, cid);
+                return null;
+            }
+
+            // 取 id 最大的一条 AAC-LC 音轨（30216=64K, 30232=128K, 30280=192K）
+            JsonObject best = null;
+            int bestId = Integer.MIN_VALUE;
+            int skipped = 0;
+            for (JsonElement el : audioArray) {
+                if (!el.isJsonObject()) continue;
+                JsonObject o = el.getAsJsonObject();
+                String codecs = o.has("codecs") && o.get("codecs").isJsonPrimitive()
+                        ? o.get("codecs").getAsString() : "";
+                if (!isDecodableAac(codecs)) {
+                    skipped++;
+                    continue;
+                }
+                int id = o.has("id") && o.get("id").isJsonPrimitive() ? o.get("id").getAsInt() : 0;
+                if (id > bestId) {
+                    bestId = id;
+                    best = o;
+                }
+            }
+            if (best == null) {
+                logger.warn("该视频没有 AAC-LC 音轨（跳过 {} 条：HE-AAC/杜比/无损客户端解不了）"
+                        + "，回退服务端 ffmpeg 转码: bvid={}, cid={}", skipped, bvid, cid);
+                return null;
+            }
+
+            // 主链 + 备用 CDN，去重后按顺序返回（单个CDN节点抽风时客户端可自动换链）
+            LinkedHashSet<String> urls = new LinkedHashSet<>();
+            addAudioUrl(urls, best, "baseUrl");
+            addAudioUrl(urls, best, "base_url");
+            for (String key : new String[]{"backupUrl", "backup_url"}) {
+                if (!best.has(key) || !best.get(key).isJsonArray()) continue;
+                for (JsonElement el : best.getAsJsonArray(key)) {
+                    if (el.isJsonPrimitive()) addAudioUrl(urls, el.getAsString());
+                }
+            }
+            if (urls.isEmpty()) {
+                logger.warn("音轨地址为空: bvid={}, cid={}", bvid, cid);
+                return null;
+            }
+
+            logger.info("解析B站音频直链成功: bvid={}, cid={}, 音质={}, codecs={}, 候选={}条",
+                    bvid, cid, bestId,
+                    best.has("codecs") ? best.get("codecs").getAsString() : "?", urls.size());
+            return String.join("\n", urls);
+        } catch (Exception e) {
+            logger.error("解析B站音频直链失败: " + e.getMessage(), e);
+            return null;
+        }
+    }
+
+    /**
+     * 客户端内置的是纯 Java 的 AAC-LC 解码器（JAAD），没有 SBR/PS 支持，所以：
+     *   mp4a.40.2 = AAC-LC          → 可以直链播放
+     *   mp4a.40.5 = HE-AAC(SBR)     → 解不了（实测 JAAD 会抛 "too many bands"）
+     *   mp4a.40.29 = HE-AACv2(PS)   → 解不了
+     *   ec-3(杜比) / fLaC(Hi-Res)   → 解不了
+     * 遇到不能解的必须返回 false，让上层回退到服务端 ffmpeg 转码（ffmpeg 什么都能解）。
+     */
+    private static boolean isDecodableAac(String codecs) {
+        if (codecs == null) return false;
+        String c = codecs.trim().toLowerCase(java.util.Locale.ROOT);
+        if (!c.startsWith("mp4a")) return false;
+        if (c.equals("mp4a")) return true; // 没给 profile，按最常见的 LC 处理
+        String[] parts = c.split("\\.");
+        // mp4a.40.2 → [mp4a, 40, 2]：objectTypeIndication=0x40(MPEG-4 Audio), audioObjectType=2(LC)
+        return parts.length == 3 && "40".equals(parts[1]) && "2".equals(parts[2]);
+    }
+
+    private void addAudioUrl(java.util.Set<String> urls, JsonObject obj, String key) {
+        if (!obj.has(key) || !obj.get(key).isJsonPrimitive()) return;
+        addAudioUrl(urls, obj.get(key).getAsString());
+    }
+
+    private void addAudioUrl(java.util.Set<String> urls, String url) {
+        if (url == null) return;
+        url = url.trim();
+        if (!url.isEmpty()) urls.add(url);
+    }
+
+    /**
+     * 请求 playurl 接口取 data：优先 WBI 签名接口（能拿到最全的音轨），失败回退旧接口。
+     */
+    private JsonObject requestPlayUrlData(String bvid, String cid) {
+        // 1) WBI 签名接口：fnval=4048 表示 DASH 全量流（含杜比/Hi-Res），fourk=1 必须带
+        try {
+            Map<String, String> params = new HashMap<>();
+            params.put("bvid", bvid);
+            params.put("cid", cid);
+            params.put("qn", "80");
+            params.put("fnval", "4048");
+            params.put("fnver", "0");
+            params.put("fourk", "1");
+
+            String signedUrl = buildWbiUrl("/x/player/wbi/playurl", params);
+            if (signedUrl != null) {
+                JsonObject json = parseResponseSafe(HttpUtil.get(signedUrl, getAntiScrapingHeaders()));
+                if (json != null && json.has("data") && json.get("data").isJsonObject()
+                        && json.has("code") && json.get("code").getAsInt() == 0) {
+                    return json.getAsJsonObject("data");
+                }
+                logger.warn("WBI playurl 未成功: bvid={}, code={}", bvid,
+                        json != null && json.has("code") ? json.get("code").getAsString() : "空响应");
+            }
+        } catch (Exception e) {
+            logger.warn("WBI playurl 请求异常: {} ({})", e.getMessage(), bvid);
+        }
+
+        // 2) 旧接口兜底（未签名，风控下可能降级，但仍是可用的退路）
+        try {
+            String url = API_URL + "/x/player/playurl?bvid=" + bvid + "&cid=" + cid
+                    + "&qn=80&fnval=16&fourk=1";
+            JsonObject json = parseResponseSafe(HttpUtil.get(url, getAntiScrapingHeaders()));
+            if (json != null && json.has("data") && json.get("data").isJsonObject()
+                    && json.has("code") && json.get("code").getAsInt() == 0) {
+                return json.getAsJsonObject("data");
+            }
+        } catch (Exception e) {
+            logger.warn("旧 playurl 接口请求异常: {} ({})", e.getMessage(), bvid);
+        }
+        return null;
+    }
+
+    /**
+     * 构建 WBI 签名接口 URL（与 buildSubtitleListUrl 同一套签名规则）。
+     * 返回 null 表示签名密钥不可用，由调用方回退未签名接口。
+     */
+    private String buildWbiUrl(String path, Map<String, String> params) {
+        fetchWbiKeys();
+        if (wbiImgKey.isEmpty() || wbiSubKey.isEmpty()) {
+            logger.warn("WBI密钥不可用，无法签名接口: {}", path);
+            return null;
+        }
+
+        Map<String, String> all = new HashMap<>(params);
+        all.put("wts", String.valueOf(System.currentTimeMillis() / 1000));
+
+        List<String> keys = new ArrayList<>(all.keySet());
+        java.util.Collections.sort(keys);
+
+        StringBuilder query = new StringBuilder();
+        for (int i = 0; i < keys.size(); i++) {
+            if (i > 0) query.append("&");
+            String key = keys.get(i);
+            String value = all.get(key);
+            if (value == null) value = "";
+            value = value.replaceAll("[!'()*]", "");
+            query.append(key).append("=").append(URLEncoder.encode(value, StandardCharsets.UTF_8));
+        }
+
+        query.append("&w_rid=").append(md5(query.toString() + getMixinKey()));
+        return API_URL + path + "?" + query;
     }
 
     /**
@@ -839,9 +1044,9 @@ public class BilibiliSource implements MusicSource {
         // 缓存文件名带上 cid（分P），避免不同分P混用同一份音频
         String cacheBase = bvid + "_" + cid;
 
-        // 检查缓存
+        // 检查缓存（0 字节的残留文件不算有效缓存）
         File cachedMp3 = new File(cacheDir, cacheBase + ".mp3");
-        if (cachedMp3.exists()) {
+        if (cachedMp3.exists() && cachedMp3.length() > 0) {
             logger.info("使用缓存文件: {}", cachedMp3.getAbsolutePath());
             return AllMusicPlugin.getInstance().getHttpFileServer().getFileUrl(cachedMp3);
         }
@@ -851,25 +1056,35 @@ public class BilibiliSource implements MusicSource {
             return null;
         }
 
+        String tempAudio = cacheDir + "/" + cacheBase + "_temp.m4s";
+        slowPathOperations.incrementAndGet();
         try {
             // 下载音频到临时文件
-            String tempAudio = cacheDir + "/" + cacheBase + "_temp.m4s";
             logger.info("开始下载B站音频: {}", bvid);
             downloadFile(audioUrl, tempAudio);
 
             // 使用ffmpeg转码为MP3
             logger.info("开始转码B站音频为MP3: {}", bvid);
-            boolean success = FfmpegUtil.extractAudio(ffmpegPath, tempAudio, cachedMp3.getAbsolutePath());
-
-            // 删除临时文件
-            new File(tempAudio).delete();
+            boolean success = FfmpegUtil.extractAudio(ffmpegPath, tempAudio, cachedMp3.getAbsolutePath(),
+                    configManager.getFfmpegTimeoutSeconds());
 
             if (success) {
                 FfmpegUtil.cleanCache(cacheDir, configManager.getFfmpegCacheMaxSize());
                 return AllMusicPlugin.getInstance().getHttpFileServer().getFileUrl(cachedMp3);
             }
+            // 失败/超时可能留下半截 mp3：当成缓存会一直给客户端下发损坏文件
+            if (cachedMp3.exists() && !cachedMp3.delete()) {
+                logger.warn("删除失败的转码输出文件失败: {}", cachedMp3.getAbsolutePath());
+            }
         } catch (Exception e) {
             logger.error("B站音频转码失败: " + e.getMessage(), e);
+            cachedMp3.delete();
+        } finally {
+            // 临时文件统一在这里清理：下载抛异常时原实现根本走不到删除那一步
+            if (!new File(tempAudio).delete() && new File(tempAudio).exists()) {
+                logger.warn("临时文件删除失败(可能仍被占用): {}", tempAudio);
+            }
+            slowPathOperations.decrementAndGet();
         }
         return null;
     }
@@ -905,20 +1120,31 @@ public class BilibiliSource implements MusicSource {
 
             // 下载视频到临时文件
             String tempVideo = cacheDir + "/" + cacheBase + "_temp.mp4";
-            logger.info("开始下载视频: {}", bvid);
-            downloadFile(videoUrl, tempVideo);
+            slowPathOperations.incrementAndGet();
+            try {
+                logger.info("开始下载视频: {}", bvid);
+                downloadFile(videoUrl, tempVideo);
 
-            // 使用ffmpeg转码
-            logger.info("开始转码: {}", bvid);
-            boolean success = FfmpegUtil.extractAudio(ffmpegPath, tempVideo, cachedFile);
+                // 使用ffmpeg转码
+                logger.info("开始转码: {}", bvid);
+                boolean success = FfmpegUtil.extractAudio(ffmpegPath, tempVideo, cachedFile,
+                        configManager.getFfmpegTimeoutSeconds());
 
-            // 删除临时文件
-            new File(tempVideo).delete();
-
-            if (success) {
-                // 清理旧缓存
-                FfmpegUtil.cleanCache(cacheDir, configManager.getFfmpegCacheMaxSize());
-                return AllMusicPlugin.getInstance().getHttpFileServer().getFileUrl(new File(cachedFile));
+                if (success) {
+                    // 清理旧缓存
+                    FfmpegUtil.cleanCache(cacheDir, configManager.getFfmpegCacheMaxSize());
+                    return AllMusicPlugin.getInstance().getHttpFileServer().getFileUrl(new File(cachedFile));
+                }
+                // 失败/超时可能留下半截 mp3：当成缓存会一直给客户端下发损坏文件
+                if (new File(cachedFile).exists() && !new File(cachedFile).delete()) {
+                    logger.warn("删除失败的转码输出文件失败: {}", cachedFile);
+                }
+            } finally {
+                // 临时文件统一在这里清理：下载抛异常时原实现根本走不到删除那一步
+                if (!new File(tempVideo).delete() && new File(tempVideo).exists()) {
+                    logger.warn("临时文件删除失败(可能仍被占用): {}", tempVideo);
+                }
+                slowPathOperations.decrementAndGet();
             }
         } catch (Exception e) {
             logger.error("转码失败: " + e.getMessage(), e);
@@ -956,6 +1182,8 @@ public class BilibiliSource implements MusicSource {
     private void downloadFile(String url, String savePath) throws Exception {
         // 确保目录存在
         new File(savePath).getParentFile().mkdirs();
+        // 先写 .part，全部校验通过后再原子改名：失败不留半截文件
+        File part = new File(savePath + ".part");
 
         // 使用OkHttp下载
         okhttp3.Request request = new okhttp3.Request.Builder()
@@ -964,22 +1192,42 @@ public class BilibiliSource implements MusicSource {
                 .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
                 .build();
 
-        try (okhttp3.Response response = HttpUtil.getClient().newCall(request).execute()) {
+        // 下载专用客户端：加整体超时。逐次读的 readTimeout 拦不住「慢速滴流」，
+        // 连接只要时不时有数据就能无限期挂着，把整个队列的取歌锁拖死。
+        int timeoutSeconds = configManager.getBilibiliDownloadTimeoutSeconds();
+        okhttp3.OkHttpClient downloadClient = timeoutSeconds > 0
+                ? HttpUtil.getClient().newBuilder().callTimeout(timeoutSeconds, TimeUnit.SECONDS).build()
+                : HttpUtil.getClient();
+
+        try (okhttp3.Response response = downloadClient.newCall(request).execute()) {
             if (!response.isSuccessful()) {
                 throw new Exception("下载失败: " + response.code());
             }
 
-            java.io.InputStream inputStream = response.body().byteStream();
-            java.io.FileOutputStream outputStream = new java.io.FileOutputStream(savePath);
-
-            byte[] buffer = new byte[8192];
-            int bytesRead;
-            while ((bytesRead = inputStream.read(buffer)) != -1) {
-                outputStream.write(buffer, 0, bytesRead);
+            long expected = response.body().contentLength(); // -1 = 未知
+            long total = 0;
+            try (java.io.InputStream inputStream = response.body().byteStream();
+                 java.io.FileOutputStream outputStream = new java.io.FileOutputStream(part)) {
+                byte[] buffer = new byte[8192];
+                int bytesRead;
+                while ((bytesRead = inputStream.read(buffer)) != -1) {
+                    outputStream.write(buffer, 0, bytesRead);
+                    total += bytesRead;
+                }
+                outputStream.flush();
             }
 
-            outputStream.close();
-            inputStream.close();
+            // B站 CDN 会「干净地」提前掐断连接（read 返回 -1 而不抛异常），必须按长度识别，
+            // 否则半截 m4s 会当成完整文件喂给 ffmpeg
+            if (expected >= 0 && total != expected) {
+                throw new Exception("下载不完整: " + total + "/" + expected + " 字节");
+            }
+
+            java.nio.file.Files.move(part.toPath(), new File(savePath).toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } catch (Exception e) {
+            part.delete();
+            throw e;
         }
     }
 

@@ -22,6 +22,10 @@ dependencies {
     // JLayer - MP3 解码器（javax.sound 原生不支持 MP3）
     implementation("com.googlecode.soundlibs:jlayer:1.0.1.4")
     include("com.googlecode.soundlibs:jlayer:1.0.1.4")
+
+    // JAAD - 纯 Java AAC 解码器（B站直链的 m4s 是 fMP4 容器里的 AAC，JLayer 解不了）
+    implementation("de.sfuhrm:jaad:0.8.7")
+    include("de.sfuhrm:jaad:0.8.7")
 }
 
 tasks {

@@ -26,6 +26,16 @@ public class HttpUtil {
             .followSslRedirects(true)
             .build();
 
+    /**
+     * API 请求专用客户端：在共享客户端之上加「单次调用整体超时」。
+     * readTimeout 只约束单次读，服务端只要慢速滴流有数据就能让 body.string() 无限期挂着；
+     * callTimeout 封顶整次调用，是所有音源 API 请求的第二道保险（第一道是队列取歌看门狗）。
+     * 注意：大文件下载不走它（走 getClient()），避免正常下载被误杀。
+     */
+    private static final OkHttpClient apiClient = client.newBuilder()
+            .callTimeout(45, TimeUnit.SECONDS)
+            .build();
+
     private static final Gson gson = new Gson();
 
     /**
@@ -59,7 +69,7 @@ public class HttpUtil {
             }
         }
 
-        try (Response response = client.newCall(builder.build()).execute()) {
+        try (Response response = apiClient.newCall(builder.build()).execute()) {
             if (!response.isSuccessful()) {
                 throw new IOException("HTTP GET failed: " + response.code() + " " + response.message());
             }
@@ -82,7 +92,7 @@ public class HttpUtil {
             }
         }
 
-        try (Response response = client.newCall(builder.build()).execute()) {
+        try (Response response = apiClient.newCall(builder.build()).execute()) {
             if (!response.isSuccessful()) {
                 throw new IOException("HTTP GET failed: " + response.code() + " " + response.message());
             }
@@ -129,7 +139,7 @@ public class HttpUtil {
             }
         }
 
-        try (Response response = client.newCall(builder.build()).execute()) {
+        try (Response response = apiClient.newCall(builder.build()).execute()) {
             if (!response.isSuccessful()) {
                 throw new IOException("HTTP POST failed: " + response.code() + " " + response.message());
             }
@@ -154,7 +164,7 @@ public class HttpUtil {
                 .post(formBuilder.build())
                 .build();
 
-        try (Response response = client.newCall(request).execute()) {
+        try (Response response = apiClient.newCall(request).execute()) {
             if (!response.isSuccessful()) {
                 throw new IOException("HTTP POST failed: " + response.code() + " " + response.message());
             }
@@ -173,7 +183,7 @@ public class HttpUtil {
                 .get()
                 .build();
 
-        try (Response response = client.newCall(request).execute()) {
+        try (Response response = apiClient.newCall(request).execute()) {
             if (!response.isSuccessful()) {
                 throw new IOException("HTTP GET failed: " + response.code() + " " + response.message());
             }

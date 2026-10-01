@@ -82,6 +82,16 @@ public interface MusicSource {
     String getLoginStatus();
 
     /**
+     * 当前是否正在执行「服务端下载 / 转码」这类明知耗时的慢操作。
+     *
+     * 队列看门狗据此放宽超时阈值：B站直链模式下若某个视频只有 HE-AAC 音轨，
+     * 会自动回退到服务端转码，这条正常路径本来就慢，不能被 fast-path 的短超时误杀。
+     */
+    default boolean isInSlowPath() {
+        return false;
+    }
+
+    /**
      * 获取当前保存的 Cookie（用于重启后持久化恢复；默认无）
      */
     default String getSavedCookie() {

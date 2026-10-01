@@ -22,6 +22,16 @@ sources:
   bilibili:
     enabled: true
     base-url: "https://www.bilibili.com"
+    # 播放方式:
+    #   direct    = 直接解析出B站CDN音频直链下发给客户端，由客户端自行拉流播放（推荐）
+    #               无需 ffmpeg、不占用服务器带宽、外地玩家也不受服务器公网地址影响；
+    #               需要客户端为配套的新版 (v1.0.2+) 才能解码 B站的 m4s(AAC) 音频。
+    #   transcode = 旧方案：服务端下载 + ffmpeg 转码为 MP3，再用内置 HTTP 服务分发给客户端
+    #               （客户端版本较旧时的兼容选项）
+    play-mode: direct
+    # 服务端下载B站音频/视频临时文件的整体超时(秒)：超时按取歌失败处理并清理临时文件
+    # 仅 transcode 模式与 direct 的回退路径（无 AAC-LC 音轨的视频）使用；0 或负数 = 不限
+    download-timeout-seconds: 300
 
 # 队列配置
 queue:
@@ -30,6 +40,14 @@ queue:
   auto-play: true        # 当前播放完毕后自动播放下一首
   history-size: 100      # 保存的历史播放记录数量(用于"上一首"功能)
   save-on-shutdown: true # 关服时保存队列到文件
+  # 单首歌「取详情/解析播放URL」的看门狗超时(秒)：超时则跳过该歌并自动播下一首，
+  # 防止一个卡住的音源把整个队列拖死（直链模式与网易云/酷狗等解析URL应秒级完成）。
+  # 0 或负数 = 关闭看门狗
+  fetch-timeout-seconds: 60
+  # 仅「服务端下载 + 转码」的取歌使用（B站 play-mode=transcode，或 direct 下回退转码的视频）。
+  # 必须大于 download-timeout-seconds + ffmpeg.timeout-seconds，否则可能误杀正常的长转码。
+  # 0 或负数 = 关闭看门狗
+  transcode-fetch-timeout-seconds: 900
 
 # 播放配置
 playback:
@@ -58,6 +76,7 @@ ffmpeg:
   path: "ffmpeg"         # ffmpeg 可执行文件路径
   cache-dir: "plugins/MygoMusic/cache/bilibili"  # B站转码缓存目录
   cache-max-size: 1024   # 缓存最大大小 (MB)
+  timeout-seconds: 300   # 单次转码超时 (秒)：超时强制结束 ffmpeg 进程并判失败；慢CPU/长视频可调大
 
 # 权限配置
 permissions:

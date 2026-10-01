@@ -198,7 +198,7 @@ public class ChannelHandler {
 
                 // 播放音频
                 if (playUrl != null && !playUrl.isEmpty()) {
-                    audioPlayer.play(playUrl, title, artist, duration);
+                    audioPlayer.play(playUrl, title, artist, duration, source);
                     logger.info("开始播放: {} - {}", title, artist);
                 } else {
                     logger.warn("没有可用的播放URL");

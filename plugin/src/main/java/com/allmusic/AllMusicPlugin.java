@@ -57,9 +57,18 @@ public class AllMusicPlugin extends JavaPlugin {
             pluginChannel = new PluginChannel(this, queueScheduler);
 
             // 启动 HTTP 文件服务器（用于 B站转码后的 MP3）
+            // 直链模式下也保留：视频只有 HE-AAC/杜比/无损音轨时会回退到转码分发
             httpFileServer = new HttpFileServer();
             httpFileServer.start(configManager.getHttpServerPort(), configManager.getFfmpegCacheDir(),
                     configManager.getHttpServerHost());
+
+            // B站播放方式提示
+            if ("transcode".equalsIgnoreCase(configManager.getBilibiliPlayMode())) {
+                logger.info("B站播放方式: transcode（服务端 ffmpeg 转码 MP3，需已安装 ffmpeg）");
+            } else {
+                logger.info("B站播放方式: direct（下发B站CDN直链，客户端自行拉流解码；"
+                        + "需要 v1.0.2+ 客户端，旧客户端播放B站音频会失败）");
+            }
 
             // 注册命令
             getCommand("mm").setExecutor(new MusicCommand(this, sourceManager, playQueue, queueScheduler, pluginChannel, configManager, databaseManager));

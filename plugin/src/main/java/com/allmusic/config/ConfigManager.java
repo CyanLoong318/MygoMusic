@@ -26,6 +26,8 @@ public class ConfigManager {
     private boolean neteaseEnabled;
     private boolean kugouEnabled;
     private boolean bilibiliEnabled;
+    private String bilibiliPlayMode; // direct: 直接下发B站直链给客户端 / transcode: 服务端ffmpeg转码MP3
+    private int bilibiliDownloadTimeoutSeconds; // 服务端下载B站音频/视频的整体超时(秒)，<=0=不限
 
     // 队列配置
     private int queueMaxSize;
@@ -33,6 +35,8 @@ public class ConfigManager {
     private boolean autoPlay;
     private int historySize;
     private boolean saveOnShutdown;
+    private int fetchTimeoutSeconds;          // 单首歌「取详情/解析URL」看门狗(秒)，<=0=关闭
+    private int transcodeFetchTimeoutSeconds; // 走服务端下载/转码的取歌看门狗(秒)，<=0=关闭
 
     // 播放配置
     private int defaultVolume;
@@ -45,6 +49,7 @@ public class ConfigManager {
     private String ffmpegPath;
     private String ffmpegCacheDir;
     private int ffmpegCacheMaxSize;
+    private int ffmpegTimeoutSeconds; // 单次ffmpeg转码超时(秒)，<=0=用默认值
 
     // 客户端音频缓存配置（由服务端统一下发，客户端GUI不再提供该设置）
     private boolean clientCacheEnabled;
@@ -81,6 +86,8 @@ public class ConfigManager {
         neteaseEnabled = config.getBoolean("sources.netease.enabled", true);
         kugouEnabled = config.getBoolean("sources.kugou.enabled", true);
         bilibiliEnabled = config.getBoolean("sources.bilibili.enabled", true);
+        bilibiliPlayMode = config.getString("sources.bilibili.play-mode", "direct");
+        bilibiliDownloadTimeoutSeconds = config.getInt("sources.bilibili.download-timeout-seconds", 300);
 
         // 队列配置
         queueMaxSize = config.getInt("queue.max-size", 50);
@@ -88,6 +95,8 @@ public class ConfigManager {
         autoPlay = config.getBoolean("queue.auto-play", true);
         historySize = config.getInt("queue.history-size", 100);
         saveOnShutdown = config.getBoolean("queue.save-on-shutdown", true);
+        fetchTimeoutSeconds = config.getInt("queue.fetch-timeout-seconds", 60);
+        transcodeFetchTimeoutSeconds = config.getInt("queue.transcode-fetch-timeout-seconds", 900);
 
         // 播放配置
         defaultVolume = config.getInt("playback.default-volume", 80);
@@ -100,6 +109,7 @@ public class ConfigManager {
         ffmpegPath = config.getString("ffmpeg.path", "ffmpeg");
         ffmpegCacheDir = new File(config.getString("ffmpeg.cache-dir", "plugins/MygoMusic/cache/bilibili")).getAbsolutePath();
         ffmpegCacheMaxSize = config.getInt("ffmpeg.cache-max-size", 1024);
+        ffmpegTimeoutSeconds = config.getInt("ffmpeg.timeout-seconds", 300);
 
         // 客户端音频缓存（服务端统一设置）
         clientCacheEnabled = config.getBoolean("client-cache.enabled", true);
@@ -162,17 +172,22 @@ public class ConfigManager {
     public boolean isNeteaseEnabled() { return neteaseEnabled; }
     public boolean isKugouEnabled() { return kugouEnabled; }
     public boolean isBilibiliEnabled() { return bilibiliEnabled; }
+    public String getBilibiliPlayMode() { return bilibiliPlayMode; }
+    public int getBilibiliDownloadTimeoutSeconds() { return bilibiliDownloadTimeoutSeconds; }
     public int getQueueMaxSize() { return queueMaxSize; }
     public int getCooldownSeconds() { return cooldownSeconds; }
     public boolean isAutoPlay() { return autoPlay; }
     public int getHistorySize() { return historySize; }
     public boolean isSaveOnShutdown() { return saveOnShutdown; }
+    public int getFetchTimeoutSeconds() { return fetchTimeoutSeconds; }
+    public int getTranscodeFetchTimeoutSeconds() { return transcodeFetchTimeoutSeconds; }
     public int getDefaultVolume() { return defaultVolume; }
     public boolean isLyricsEnabled() { return lyricsEnabled; }
     public String getShowTranslation() { return showTranslation; }
     public String getFfmpegPath() { return ffmpegPath; }
     public String getFfmpegCacheDir() { return ffmpegCacheDir; }
     public int getFfmpegCacheMaxSize() { return ffmpegCacheMaxSize; }
+    public int getFfmpegTimeoutSeconds() { return ffmpegTimeoutSeconds; }
     public boolean isClientCacheEnabled() { return clientCacheEnabled; }
     public int getClientCacheMaxSizeMb() { return clientCacheMaxSizeMb; }
     public int getHttpServerPort() { return httpServerPort; }
