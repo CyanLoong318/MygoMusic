@@ -10,7 +10,7 @@
 本项目的创意与部分设计参考了 **zmusic**（MC Java 版全服音乐 / 点歌）项目，感谢其原作者 **zhenxin**。
 https://github.com/starhui-dev/zmusic-plugin
 
-B站音频直链解析的实现参考了 **FrecklyComb1728** 的 **BiliParser**（`biliparser`，零依赖的B站直链解析 CLI）中 WBI 签名与音轨选择的思路，特此致谢。
+B站音频直链解析的实现参考了 **FrecklyComb1728** 的 **BiliParser**中 WBI 签名与音轨选择的思路，特此致谢。
 https://github.com/FrecklyComb1728/BiliParser
 
 在此一并感谢 **Fluorine_Arrow**、**ZMIBPZF**。
