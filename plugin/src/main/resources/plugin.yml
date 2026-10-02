@@ -32,13 +32,10 @@ permissions:
     description: 允许开关歌词
     default: true
   mygomusic.login:
-    description: 允许登录平台账号
-    default: true
+    description: 允许登录平台账号（登录态是全服共享的，只应给管理员）
+    default: op
   mygomusic.nocooldown:
     description: 免点歌冷却
-    default: false
-  mygomusic.queuelimit:
-    description: 队列优先(可同时点更多首)
     default: false
   mygomusic.admin:
     description: 管理员命令

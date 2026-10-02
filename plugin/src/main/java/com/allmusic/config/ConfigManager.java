@@ -38,13 +38,6 @@ public class ConfigManager {
     private int fetchTimeoutSeconds;          // 单首歌「取详情/解析URL」看门狗(秒)，<=0=关闭
     private int transcodeFetchTimeoutSeconds; // 走服务端下载/转码的取歌看门狗(秒)，<=0=关闭
 
-    // 播放配置
-    private int defaultVolume;
-
-    // 歌词配置
-    private boolean lyricsEnabled;
-    private String showTranslation; // auto/true/false
-
     // FFmpeg 配置
     private String ffmpegPath;
     private String ffmpegCacheDir;
@@ -61,7 +54,6 @@ public class ConfigManager {
 
     // 权限配置
     private String cooldownBypassPermission;
-    private String queueLimitPermission;
 
     public ConfigManager(JavaPlugin plugin) {
         this.plugin = plugin;
@@ -98,13 +90,6 @@ public class ConfigManager {
         fetchTimeoutSeconds = config.getInt("queue.fetch-timeout-seconds", 60);
         transcodeFetchTimeoutSeconds = config.getInt("queue.transcode-fetch-timeout-seconds", 900);
 
-        // 播放配置
-        defaultVolume = config.getInt("playback.default-volume", 80);
-
-        // 歌词配置
-        lyricsEnabled = config.getBoolean("lyrics.enabled", true);
-        showTranslation = config.getString("lyrics.show-translation", "auto");
-
         // FFmpeg 配置
         ffmpegPath = config.getString("ffmpeg.path", "ffmpeg");
         ffmpegCacheDir = new File(config.getString("ffmpeg.cache-dir", "plugins/MygoMusic/cache/bilibili")).getAbsolutePath();
@@ -121,7 +106,6 @@ public class ConfigManager {
 
         // 权限配置
         cooldownBypassPermission = config.getString("permissions.cooldown-bypass", "mygomusic.nocooldown");
-        queueLimitPermission = config.getString("permissions.queue-limit", "mygomusic.queuelimit");
 
         // 确保缓存目录存在
         new File(ffmpegCacheDir).mkdirs();
@@ -144,6 +128,24 @@ public class ConfigManager {
             plugin.getLogger().info("已保存 " + platform + " 登录Cookie，重启后自动恢复");
         } catch (Exception e) {
             plugin.getLogger().warning("保存 " + platform + " Cookie 失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 清除某平台已保存的登录 Cookie（/mm logout 用）。
+     * 不删的话登出只对本次运行有效，重启后 cookies.yml 里的旧 Cookie 会被重新加载，
+     * 玩家会发现自己「登出」了的账号又自己登录回去了。
+     */
+    public void removeSourceCookie(String platform) {
+        try {
+            File file = new File(plugin.getDataFolder(), "cookies.yml");
+            if (!file.exists()) return;
+            FileConfiguration c = YamlConfiguration.loadConfiguration(file);
+            c.set("cookies." + platform, null);
+            c.save(file);
+            plugin.getLogger().info("已清除 " + platform + " 的登录Cookie");
+        } catch (Exception e) {
+            plugin.getLogger().warning("清除 " + platform + " Cookie 失败: " + e.getMessage());
         }
     }
 
@@ -181,9 +183,6 @@ public class ConfigManager {
     public boolean isSaveOnShutdown() { return saveOnShutdown; }
     public int getFetchTimeoutSeconds() { return fetchTimeoutSeconds; }
     public int getTranscodeFetchTimeoutSeconds() { return transcodeFetchTimeoutSeconds; }
-    public int getDefaultVolume() { return defaultVolume; }
-    public boolean isLyricsEnabled() { return lyricsEnabled; }
-    public String getShowTranslation() { return showTranslation; }
     public String getFfmpegPath() { return ffmpegPath; }
     public String getFfmpegCacheDir() { return ffmpegCacheDir; }
     public int getFfmpegCacheMaxSize() { return ffmpegCacheMaxSize; }
@@ -193,5 +192,4 @@ public class ConfigManager {
     public int getHttpServerPort() { return httpServerPort; }
     public String getHttpServerHost() { return httpServerHost; }
     public String getCooldownBypassPermission() { return cooldownBypassPermission; }
-    public String getQueueLimitPermission() { return queueLimitPermission; }
 }

@@ -7,6 +7,8 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -77,7 +79,14 @@ public class FfmpegUtil {
             boolean finished = process.waitFor(timeout, TimeUnit.SECONDS);
             if (!finished) {
                 process.destroyForcibly(); // 不留孤儿进程：否则它继续占着临时文件，后面删都删不掉
+                // 等进程真正退出：Windows 上进程未退出前文件句柄未释放，删/改名半截输出都会失败
+                try {
+                    process.waitFor(5, TimeUnit.SECONDS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
                 logger.error("FFmpeg 转码超时({}秒)，已强制结束: {}", timeout, inputPath);
+                discardPartial(outputFile);
                 return false;
             }
             drain.join(1000); // 等排空线程收尾，失败时日志里才有 ffmpeg 的原话
@@ -87,10 +96,32 @@ public class FfmpegUtil {
                 return true;
             }
             logger.error("FFmpeg 转码失败(退出码={}): {}{}", process.exitValue(), inputPath, tailOf(tail));
+            discardPartial(outputFile);
             return false;
         } catch (Exception e) {
             logger.error("FFmpeg 转码异常: " + e.getMessage(), e);
+            discardPartial(new File(outputPath));
             return false;
+        }
+    }
+
+    /**
+     * 丢弃转码失败/超时留下的半截输出文件。
+     * 直接删不掉（Windows 上 ffmpeg 刚被强杀时句柄可能尚未释放）时改名为 .bad 排除：
+     * 留着的话下次会被「文件已存在且非空」当成有效缓存，一直给客户端发损坏音频。
+     */
+    public static void discardPartial(File file) {
+        if (file == null || !file.exists()) return;
+        if (file.delete()) return;
+        // 用 REPLACE_EXISTING 的文件移动而不是 renameTo：后者在目标已存在时（Windows）会失败，
+        // 二次失败就覆盖不了上次的 .bad，半截 mp3 会留在原地继续被当缓存用
+        File bad = new File(file.getParentFile(), file.getName() + ".bad");
+        try {
+            Files.move(file.toPath(), bad.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            logger.warn("半截转码输出删除失败，已改名排除: {}", bad.getAbsolutePath());
+        } catch (Exception e) {
+            logger.warn("半截转码输出既删不掉也改不了名(可能仍被占用): {} ({})",
+                    file.getAbsolutePath(), e.getMessage());
         }
     }
 
@@ -134,15 +165,6 @@ public class FfmpegUtil {
     }
 
     /**
-     * 获取文件大小 (MB)
-     */
-    public static double getFileSizeMB(String filePath) {
-        File file = new File(filePath);
-        if (!file.exists()) return 0;
-        return file.length() / (1024.0 * 1024.0);
-    }
-
-    /**
      * 清理缓存目录
      */
     public static void cleanCache(String cacheDir, int maxSizeMB) {
@@ -166,7 +188,9 @@ public class FfmpegUtil {
                 double size = file.length() / (1024.0 * 1024.0);
                 if (file.delete()) {
                     totalSize -= size;
-                    logger.info("清理缓存文件: {} ({:.2f} MB)", file.getName(), size);
+                    // SLF4J 不认识 {:.2f} 这种格式，会原样打出 "{:.2f}"，得先自己格式化
+                    logger.info("清理缓存文件: {} ({} MB)", file.getName(),
+                            String.format(java.util.Locale.ROOT, "%.2f", size));
                 }
             }
         }

@@ -10,6 +10,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.StringReader;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -49,7 +51,9 @@ public class NeteaseSource implements MusicSource {
     public List<SongInfo> search(String keyword, int limit) {
         List<SongInfo> results = new ArrayList<>();
         try {
-            String url = BASE_URL + "/api/search/get/web?s=" + keyword + "&type=1&limit=" + limit;
+            // 关键词必须编码：中文、空格、& # + 等字符直接拼进 URL 会把查询串截断或改变语义
+            String url = BASE_URL + "/api/search/get/web?s="
+                    + URLEncoder.encode(keyword, StandardCharsets.UTF_8) + "&type=1&limit=" + limit;
             Map<String, String> headers = new HashMap<>();
             headers.put("Referer", BASE_URL);
             headers.put("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
@@ -256,54 +260,62 @@ public class NeteaseSource implements MusicSource {
         return new Lyrics(null, "", false);
     }
 
+    /** LRC 一行：开头可能连着写多个时间戳（副歌重复），后面才是歌词文本 */
+    private static final Pattern LRC_LINE_PATTERN =
+            Pattern.compile("^((?:\\[\\d{1,3}:\\d{1,2}(?:[.:]\\d{1,3})?\\])+)(.*)$");
+    /** 从上面那串时间戳里逐个取出 [分:秒.毫秒] */
+    private static final Pattern LRC_TIME_PATTERN =
+            Pattern.compile("\\[(\\d{1,3}):(\\d{1,2})(?:[.:](\\d{1,3}))?\\]");
+
+    /**
+     * 收集一段 LRC 文本里所有的「时间戳 → 歌词」。
+     *
+     * 一行上的每个时间戳都要收：形如 [00:12.34][01:20.56]同一句副歌，
+     * 旧实现用 find() 只取第一个，副歌第二遍开始整段没有歌词。
+     */
+    private void collectLrc(String text, Map<Long, String> out) {
+        if (text == null || text.isEmpty()) return;
+        for (String rawLine : text.split("\n")) {
+            Matcher lineMatcher = LRC_LINE_PATTERN.matcher(rawLine.trim());
+            if (!lineMatcher.matches()) continue;
+
+            String content = lineMatcher.group(2).trim();
+            if (content.isEmpty()) continue; // 纯时间戳行（空行/元信息），不产生歌词
+
+            Matcher timeMatcher = LRC_TIME_PATTERN.matcher(lineMatcher.group(1));
+            while (timeMatcher.find()) {
+                out.put(lrcTimestamp(timeMatcher.group(1), timeMatcher.group(2), timeMatcher.group(3)), content);
+            }
+        }
+    }
+
+    /**
+     * 时间戳转毫秒。毫秒位可能是 1/2/3 位：2 位按 10ms 计，1 位按 100ms 计。
+     */
+    private static long lrcTimestamp(String minutes, String seconds, String fraction) {
+        long millis = 0;
+        if (fraction != null && !fraction.isEmpty()) {
+            millis = Long.parseLong(fraction);
+            if (fraction.length() == 2) millis *= 10;
+            else if (fraction.length() == 1) millis *= 100;
+        }
+        return Long.parseLong(minutes) * 60_000L + Long.parseLong(seconds) * 1000L + millis;
+    }
+
     /**
      * 解析LRC歌词
      */
     private Lyrics parseLrc(String lrcText, String tlyricText) {
         List<LyricsLine> lines = new ArrayList<>();
-        boolean hasTranslation = false;
 
         // 解析原文歌词
         Map<Long, String> lrcMap = new HashMap<>();
-        Pattern pattern = Pattern.compile("\\[(\\d{2}):(\\d{2})\\.(\\d{2,3})\\](.*)");
-        for (String line : lrcText.split("\n")) {
-            Matcher matcher = pattern.matcher(line.trim());
-            if (matcher.find()) {
-                long minutes = Long.parseLong(matcher.group(1));
-                long seconds = Long.parseLong(matcher.group(2));
-                long millis = Long.parseLong(matcher.group(3));
-                if (matcher.group(3).length() == 2) millis *= 10;
-
-                long timestamp = minutes * 60 * 1000 + seconds * 1000 + millis;
-                String text = matcher.group(4).trim();
-
-                if (!text.isEmpty()) {
-                    lrcMap.put(timestamp, text);
-                }
-            }
-        }
+        collectLrc(lrcText, lrcMap);
 
         // 解析翻译歌词
         Map<Long, String> tlyricMap = new HashMap<>();
-        if (tlyricText != null && !tlyricText.isEmpty()) {
-            for (String line : tlyricText.split("\n")) {
-                Matcher matcher = pattern.matcher(line.trim());
-                if (matcher.find()) {
-                    long minutes = Long.parseLong(matcher.group(1));
-                    long seconds = Long.parseLong(matcher.group(2));
-                    long millis = Long.parseLong(matcher.group(3));
-                    if (matcher.group(3).length() == 2) millis *= 10;
-
-                    long timestamp = minutes * 60 * 1000 + seconds * 1000 + millis;
-                    String text = matcher.group(4).trim();
-
-                    if (!text.isEmpty()) {
-                        tlyricMap.put(timestamp, text);
-                        hasTranslation = true;
-                    }
-                }
-            }
-        }
+        collectLrc(tlyricText, tlyricMap);
+        boolean hasTranslation = !tlyricMap.isEmpty();
 
         // 合并歌词
         for (Map.Entry<Long, String> entry : lrcMap.entrySet()) {
@@ -390,20 +402,28 @@ public class NeteaseSource implements MusicSource {
                         logger.info("已扫码，等待确认...");
                         break;
                     case 803: {
-                        // 登录成功，从 Set-Cookie 中提取 cookie
-                        String extractedCookie = extractCookie(response.setCookie);
-                        if (extractedCookie != null && !extractedCookie.isEmpty()) {
-                            this.cookie = extractedCookie;
-                            this.loggedIn = true;
-                            this.qrKey = "";
-                            logger.info("网易云二维码登录成功");
-                            return LoginResult.success(null, extractedCookie, "网易云登录成功");
-                        } else {
-                            logger.warn("登录成功但未获取到Cookie, setCookie={}", response.setCookie);
-                            this.loggedIn = true;
-                            this.qrKey = "";
-                            return LoginResult.success(null, "", "网易云登录成功（但未获取到完整Cookie）");
+                        // 登录成功。cookie 有两个来源：
+                        //  1) 响应体里的 cookie 字段（这个接口习惯把登录 cookie 直接塞在 JSON 里）
+                        //  2) Set-Cookie 响应头（可能有多条，必须全部收齐，response.header() 只给最后一条）
+                        String rawCookie = json.has("cookie") && !json.get("cookie").isJsonNull()
+                                ? json.get("cookie").getAsString() : null;
+                        String extractedCookie = extractCookie(rawCookie);
+                        if (extractedCookie == null || extractedCookie.isEmpty()) {
+                            extractedCookie = extractCookies(response.setCookies);
                         }
+
+                        if (extractedCookie == null || extractedCookie.isEmpty()) {
+                            this.qrKey = "";
+                            logger.warn("网易云扫码已确认，但响应里没有可用的登录 Cookie（Set-Cookie 数={}）",
+                                    response.setCookies.size());
+                            return LoginResult.failure("扫码已确认，但未能取得登录 Cookie，请重试");
+                        }
+
+                        this.cookie = extractedCookie;
+                        this.loggedIn = true;
+                        this.qrKey = "";
+                        logger.info("网易云二维码登录成功");
+                        return LoginResult.success(null, extractedCookie, "网易云登录成功");
                     }
                     case 800:
                         this.qrKey = "";
@@ -424,27 +444,46 @@ public class NeteaseSource implements MusicSource {
         return LoginResult.failure("登录超时，请重试");
     }
 
+    /** 是否网易云登录态所需的 cookie */
+    private static boolean isLoginCookie(String name) {
+        return name != null && (name.equalsIgnoreCase("MUSIC_U") || name.equalsIgnoreCase("MUSIC_A")
+                || name.equalsIgnoreCase("__csrf") || name.equalsIgnoreCase("NMTID"));
+    }
+
     /**
-     * 从 Set-Cookie 头中提取登录 Cookie
+     * 从响应体给的 cookie 串中提取登录 Cookie（形如 "MUSIC_U=xxx; Max-Age=…; Path=/; Domain=…"）
      */
-    private String extractCookie(String setCookie) {
-        if (setCookie == null || setCookie.isEmpty()) {
+    private String extractCookie(String rawCookie) {
+        if (rawCookie == null || rawCookie.isEmpty()) {
             return null;
         }
-        // Set-Cookie: MUSIC_U=xxx; path=/; ...
         StringBuilder cookieBuilder = new StringBuilder();
-        String[] parts = setCookie.split(";");
-        for (String part : parts) {
+        for (String part : rawCookie.split(";")) {
             String trimmed = part.trim();
             int eq = trimmed.indexOf('=');
-            if (eq > 0) {
-                String name = trimmed.substring(0, eq);
-                // 只保留关键 cookie（MUSIC_U 等）
-                if (name.equalsIgnoreCase("MUSIC_U") || name.equalsIgnoreCase("MUSIC_A")
-                        || name.equalsIgnoreCase("__csrf") || name.equalsIgnoreCase("NMTID")) {
-                    if (cookieBuilder.length() > 0) cookieBuilder.append("; ");
-                    cookieBuilder.append(trimmed);
-                }
+            if (eq > 0 && isLoginCookie(trimmed.substring(0, eq).trim())) {
+                if (cookieBuilder.length() > 0) cookieBuilder.append("; ");
+                cookieBuilder.append(trimmed);
+            }
+        }
+        return cookieBuilder.length() > 0 ? cookieBuilder.toString() : null;
+    }
+
+    /**
+     * 从多条 Set-Cookie 头中提取登录 Cookie。
+     * 每条头只取开头的 name=value —— 后面的 Path/Expires/Domain 是属性，不是 cookie 本身。
+     */
+    private String extractCookies(List<String> setCookies) {
+        if (setCookies == null || setCookies.isEmpty()) return null;
+        StringBuilder cookieBuilder = new StringBuilder();
+        for (String header : setCookies) {
+            if (header == null || header.isEmpty()) continue;
+            int semi = header.indexOf(';');
+            String pair = (semi >= 0 ? header.substring(0, semi) : header).trim();
+            int eq = pair.indexOf('=');
+            if (eq > 0 && isLoginCookie(pair.substring(0, eq).trim())) {
+                if (cookieBuilder.length() > 0) cookieBuilder.append("; ");
+                cookieBuilder.append(pair);
             }
         }
         return cookieBuilder.length() > 0 ? cookieBuilder.toString() : null;

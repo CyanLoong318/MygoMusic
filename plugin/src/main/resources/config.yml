@@ -49,14 +49,9 @@ queue:
   # 0 或负数 = 关闭看门狗
   transcode-fetch-timeout-seconds: 900
 
-# 播放配置
-playback:
-  default-volume: 80     # 默认音量 (0-100)
-
-# 歌词配置
-lyrics:
-  enabled: true          # 是否启用歌词显示
-  show-translation: auto # auto: 中文不翻译, 外文有翻译就显示; true: 总是显示; false: 从不显示
+# 说明：音量与歌词显示都是「客户端本地设置」，服务端无法代管
+# （音频在玩家客户端播放），因此这里不再提供 default-volume / lyrics.* 之类的开关，
+# 免得填了却不生效。玩家用 /mm volume 与 /mm lyrics 调整自己的设置。
 
 # 客户端音频缓存设置（由服务端统一下发，客户端GUI不再提供该设置）
 client-cache:
@@ -80,5 +75,4 @@ ffmpeg:
 
 # 权限配置
 permissions:
-  cooldown-bypass: "mygomusic.nocooldown"  # 免冷却权限
-  queue-limit: "mygomusic.queuelimit"      # 队列优先权限
+  cooldown-bypass: "mygomusic.nocooldown"  # 免冷却权限（/mm play、/mm select、/mm playid 通用）

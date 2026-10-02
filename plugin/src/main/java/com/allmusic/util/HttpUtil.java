@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.StringReader;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -98,8 +99,10 @@ public class HttpUtil {
             }
             ResponseBody body = response.body();
             String bodyStr = body != null ? body.string() : "";
-            String setCookie = response.header("Set-Cookie");
-            return new HttpResponse(bodyStr, setCookie);
+            // 一次响应可能下发多条 Set-Cookie（登录接口尤其常见：SESSDATA / bili_jct / DedeUserID 分开发）。
+            // response.header("Set-Cookie") 只返回最后一条，会把真正要用的那条丢掉，必须用 headers() 取全部。
+            List<String> setCookies = response.headers("Set-Cookie");
+            return new HttpResponse(bodyStr, setCookies);
         }
     }
 
@@ -108,11 +111,15 @@ public class HttpUtil {
      */
     public static class HttpResponse {
         public final String body;
+        /** 本次响应下发的全部 Set-Cookie 头（按顺序） */
+        public final List<String> setCookies;
+        /** 最后一条 Set-Cookie 头（兼容旧调用；多 cookie 场景请用 setCookies / cookieHeader()） */
         public final String setCookie;
 
-        public HttpResponse(String body, String setCookie) {
+        public HttpResponse(String body, List<String> setCookies) {
             this.body = body;
-            this.setCookie = setCookie;
+            this.setCookies = setCookies == null ? List.of() : List.copyOf(setCookies);
+            this.setCookie = this.setCookies.isEmpty() ? null : this.setCookies.get(this.setCookies.size() - 1);
         }
     }
 

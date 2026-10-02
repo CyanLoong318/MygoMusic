@@ -18,9 +18,11 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -39,10 +41,19 @@ public class BilibiliSource implements MusicSource {
     private String cookie = "";
     private boolean loggedIn = false;
     private String qrKey = ""; // 二维码登录的 qrcode_key
+    /** 字幕歌词缓存条数上限（键 = bvid#p页码，每首歌一条；超出按最久未用淘汰） */
+    private static final int SUBTITLE_CACHE_MAX = 256;
+
     // 字幕歌词缓存：键 = bvid#p页码。B站对同视频短时间重复请求会返回空 subtitle_url（限流降级），
     // 因此首次成功取到的字幕缓存复用，避免队列播放时重新请求导致"拿到了却没歌词"。
-    private final java.util.concurrent.ConcurrentHashMap<String, Lyrics> subtitleCache =
-            new java.util.concurrent.ConcurrentHashMap<>();
+    // 用带容量上限的 LRU：否则长开服播放过的每个视频都会在内存里留一份歌词。
+    private final Map<String, Lyrics> subtitleCache = java.util.Collections.synchronizedMap(
+            new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, Lyrics> eldest) {
+                    return size() > SUBTITLE_CACHE_MAX;
+                }
+            });
 
     /**
      * 正在执行「服务端下载 / 转码」的取歌数量（>0 = 慢路径）。
@@ -341,16 +352,10 @@ public class BilibiliSource implements MusicSource {
                     // 获取作者
                     String author = video.has("author") ? video.get("author").getAsString() : "";
 
-                    // 获取时长 (格式: "mm:ss")
+                    // 获取时长（"mm:ss"，1 小时以上的视频是 "H:mm:ss"）
                     long duration = 0;
-                    if (video.has("duration")) {
-                        String durationStr = video.get("duration").getAsString();
-                        String[] parts = durationStr.split(":");
-                        if (parts.length == 2) {
-                            try {
-                                duration = (Long.parseLong(parts[0]) * 60 + Long.parseLong(parts[1])) * 1000;
-                            } catch (NumberFormatException ignored) {}
-                        }
+                    if (video.has("duration") && !video.get("duration").isJsonNull()) {
+                        duration = parseDurationText(video.get("duration").getAsString());
                     }
 
                     // 获取封面
@@ -475,8 +480,9 @@ public class BilibiliSource implements MusicSource {
                 // 获取该分P字幕作为歌词（不包含AI字幕；需B站登录Cookie）
                 Lyrics lyrics = fetchSubtitlesAsLyrics(bvid, cid, duration, page);
 
-                // 返回的 songId 保留页码后缀，保证队列/重播仍解析到同一分P
-                String detailId = explicitPage ? bvid + "#p" + page : bvid;
+                // 返回的 songId 与 listParts 的 id 形态保持一致：多分P视频 P1 也带 "#p1"
+                // （此前 P1 返回裸 BV 号，GUI 用 "#p1" 登记的点歌回执对不上，点 P1 时搜索界面不自动关）
+                String detailId = totalPages > 1 ? bvid + "#p" + page : bvid;
                 String extra = totalPages > 1 ? String.valueOf(totalPages) : "";
 
                 return new SongDetail(detailId, displayTitle, author, "", duration, "bilibili", coverUrl, extra,
@@ -1036,9 +1042,45 @@ public class BilibiliSource implements MusicSource {
     }
 
     /**
-     * 使用ffmpeg将B站音频流(m4s/AAC)转码为MP3，并通过HTTP服务器提供
+     * 解析 "分:秒" 形式的时长文本，返回毫秒。
+     * 支持 "mm:ss" 与 "H:mm:ss"（旧实现只认两段式，1 小时以上的视频时长一律解析成 0，
+     * 而时长 0 又会被服务端当成「已播完」瞬间切歌）。
+     */
+    private static long parseDurationText(String text) {
+        if (text == null || text.isEmpty()) return 0;
+        String[] parts = text.trim().split(":");
+        try {
+            long seconds = 0;
+            for (String part : parts) {
+                seconds = seconds * 60 + Long.parseLong(part.trim());
+            }
+            return seconds * 1000;
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    /** 同一首（bvid+cid）的「下载+转码」串行化用锁 */
+    private final Map<String, Object> transcodeLocks = new ConcurrentHashMap<>();
+
+    private Object transcodeLock(String cacheBase) {
+        return transcodeLocks.computeIfAbsent(cacheBase, k -> new Object());
+    }
+
+    /**
+     * 使用ffmpeg将B站音频流(m4s/AAC)转码为MP3，并通过HTTP服务器提供。
+     *
+     * 整段加锁：两个玩家同时点同一个视频时，两边会往同一对临时文件/输出文件里写，
+     * 后启动的 ffmpeg 覆盖前一个的输出，结果两边都可能拿到损坏文件。
+     * 等锁的那个进来后会在锁内重新命中缓存，直接拿现成结果，也不会重复下载转码。
      */
     private String transcodeAudioToMp3(String bvid, String cid, String audioUrl) {
+        synchronized (transcodeLock(bvid + "_" + cid)) {
+            return transcodeAudioToMp3Locked(bvid, cid, audioUrl);
+        }
+    }
+
+    private String transcodeAudioToMp3Locked(String bvid, String cid, String audioUrl) {
         String ffmpegPath = configManager.getFfmpegPath();
         String cacheDir = configManager.getFfmpegCacheDir();
         // 缓存文件名带上 cid（分P），避免不同分P混用同一份音频
@@ -1073,12 +1115,10 @@ public class BilibiliSource implements MusicSource {
                 return AllMusicPlugin.getInstance().getHttpFileServer().getFileUrl(cachedMp3);
             }
             // 失败/超时可能留下半截 mp3：当成缓存会一直给客户端下发损坏文件
-            if (cachedMp3.exists() && !cachedMp3.delete()) {
-                logger.warn("删除失败的转码输出文件失败: {}", cachedMp3.getAbsolutePath());
-            }
+            FfmpegUtil.discardPartial(cachedMp3);
         } catch (Exception e) {
             logger.error("B站音频转码失败: " + e.getMessage(), e);
-            cachedMp3.delete();
+            FfmpegUtil.discardPartial(cachedMp3);
         } finally {
             // 临时文件统一在这里清理：下载抛异常时原实现根本走不到删除那一步
             if (!new File(tempAudio).delete() && new File(tempAudio).exists()) {
@@ -1090,9 +1130,15 @@ public class BilibiliSource implements MusicSource {
     }
 
     /**
-     * 使用ffmpeg转码视频为MP3
+     * 使用ffmpeg转码视频为MP3（整段加锁，理由同 transcodeAudioToMp3）
      */
     private String transcodeWithFfmpeg(String bvid, String cid) {
+        synchronized (transcodeLock(bvid + "_" + cid)) {
+            return transcodeWithFfmpegLocked(bvid, cid);
+        }
+    }
+
+    private String transcodeWithFfmpegLocked(String bvid, String cid) {
         String ffmpegPath = configManager.getFfmpegPath();
         String cacheDir = configManager.getFfmpegCacheDir();
 
@@ -1102,13 +1148,15 @@ public class BilibiliSource implements MusicSource {
             return null;
         }
 
-        // 检查缓存（文件名带 cid，分P各自独立）
+        // 检查缓存（文件名带 cid，分P各自独立）。0 字节的残留文件不算有效缓存：
+        // 上次转码被强杀/断电留下的空壳若被当成缓存，会一直给客户端下发放不出来的文件。
         String cacheBase = bvid + "_" + cid;
-        String cachedFile = cacheDir + "/" + cacheBase + ".mp3";
-        if (new File(cachedFile).exists()) {
-            logger.info("使用缓存文件: {}", cachedFile);
-            return AllMusicPlugin.getInstance().getHttpFileServer().getFileUrl(new File(cachedFile));
+        File cachedMp3File = new File(cacheDir, cacheBase + ".mp3");
+        if (cachedMp3File.exists() && cachedMp3File.length() > 0) {
+            logger.info("使用缓存文件: {}", cachedMp3File.getAbsolutePath());
+            return AllMusicPlugin.getInstance().getHttpFileServer().getFileUrl(cachedMp3File);
         }
+        String cachedFile = cachedMp3File.getAbsolutePath();
 
         try {
             // 获取视频下载URL
@@ -1136,9 +1184,7 @@ public class BilibiliSource implements MusicSource {
                     return AllMusicPlugin.getInstance().getHttpFileServer().getFileUrl(new File(cachedFile));
                 }
                 // 失败/超时可能留下半截 mp3：当成缓存会一直给客户端下发损坏文件
-                if (new File(cachedFile).exists() && !new File(cachedFile).delete()) {
-                    logger.warn("删除失败的转码输出文件失败: {}", cachedFile);
-                }
+                FfmpegUtil.discardPartial(new File(cachedFile));
             } finally {
                 // 临时文件统一在这里清理：下载抛异常时原实现根本走不到删除那一步
                 if (!new File(tempVideo).delete() && new File(tempVideo).exists()) {
@@ -1317,23 +1363,29 @@ public class BilibiliSource implements MusicSource {
                         logger.info("B站二维码已扫码，等待确认...");
                         break;
                     case 0: {
-                        // 登录成功，从 Set-Cookie 中提取 cookie
-                        String extractedCookie = extractBiliCookie(response.setCookie);
-                        if (extractedCookie != null && !extractedCookie.isEmpty()) {
-                            this.cookie = extractedCookie;
-                            this.loggedIn = true;
-                            this.qrKey = "";
-                            logger.info("B站二维码登录成功");
-                            return LoginResult.success(null, extractedCookie, "B站登录成功");
-                        } else {
-                            // 尝试从 data.url 中提取
-                            String urlData = data.has("url") ? data.get("url").getAsString() : "";
-                            this.cookie = urlData;
-                            this.loggedIn = true;
-                            this.qrKey = "";
-                            logger.warn("B站登录成功但未获取到完整Cookie, url={}", urlData);
-                            return LoginResult.success(null, urlData, "B站登录成功（但未获取到完整Cookie）");
+                        // 登录成功。cookie 有两个来源：
+                        //  1) Set-Cookie 响应头（一次可能有多条，SESSDATA/bili_jct/DedeUserID 分开发）
+                        //  2) data.url —— B站的跨域登录地址，登录态是挂在它的查询参数上的
+                        // 两者都拿不到就必须判失败，不能把「一个字符串」当成 cookie 存下去，
+                        // 否则账号看着是已登录、实际每个请求都还是游客身份。
+                        String extractedCookie = extractBiliCookies(response.setCookies);
+                        if (extractedCookie == null || extractedCookie.isEmpty()) {
+                            String crossDomainUrl = data.has("url") ? data.get("url").getAsString() : "";
+                            extractedCookie = extractBiliCookieFromUrl(crossDomainUrl);
                         }
+
+                        if (extractedCookie == null || extractedCookie.isEmpty()) {
+                            this.qrKey = "";
+                            logger.warn("B站扫码已确认，但响应里没有可用的登录 Cookie（Set-Cookie 数={}）",
+                                    response.setCookies.size());
+                            return LoginResult.failure("扫码已确认，但未能取得登录 Cookie，请重试");
+                        }
+
+                        this.cookie = extractedCookie;
+                        this.loggedIn = true;
+                        this.qrKey = "";
+                        logger.info("B站二维码登录成功");
+                        return LoginResult.success(null, extractedCookie, "B站登录成功");
                     }
                     case 86038:
                         this.qrKey = "";
@@ -1354,27 +1406,48 @@ public class BilibiliSource implements MusicSource {
         return LoginResult.failure("登录超时，请重试");
     }
 
+    /** 是否B站登录态所需的 cookie */
+    private static boolean isBiliLoginCookie(String name) {
+        return name != null && (name.equalsIgnoreCase("SESSDATA") || name.equalsIgnoreCase("bili_jct")
+                || name.equalsIgnoreCase("DedeUserID") || name.equalsIgnoreCase("DedeUserID__ckMd5")
+                || name.equalsIgnoreCase("sid"));
+    }
+
     /**
-     * 从 Set-Cookie 头中提取 B站登录 Cookie
+     * 从多条 Set-Cookie 头中提取 B站登录 Cookie。
+     * 每条头只取开头的 name=value —— 后面的 Path/Expires/Domain 是属性，不是 cookie 本身。
      */
-    private String extractBiliCookie(String setCookie) {
-        if (setCookie == null || setCookie.isEmpty()) {
-            return null;
-        }
+    private String extractBiliCookies(List<String> setCookies) {
+        if (setCookies == null || setCookies.isEmpty()) return null;
         StringBuilder cookieBuilder = new StringBuilder();
-        String[] parts = setCookie.split(";");
-        for (String part : parts) {
-            String trimmed = part.trim();
-            int eq = trimmed.indexOf('=');
-            if (eq > 0) {
-                String name = trimmed.substring(0, eq);
-                // 保留关键登录 cookie
-                if (name.equalsIgnoreCase("SESSDATA") || name.equalsIgnoreCase("bili_jct")
-                        || name.equalsIgnoreCase("DedeUserID") || name.equalsIgnoreCase("DedeUserID__ckMd5")
-                        || name.equalsIgnoreCase("sid")) {
-                    if (cookieBuilder.length() > 0) cookieBuilder.append("; ");
-                    cookieBuilder.append(trimmed);
-                }
+        for (String header : setCookies) {
+            if (header == null || header.isEmpty()) continue;
+            int semi = header.indexOf(';');
+            String pair = (semi >= 0 ? header.substring(0, semi) : header).trim();
+            int eq = pair.indexOf('=');
+            if (eq > 0 && isBiliLoginCookie(pair.substring(0, eq).trim())) {
+                if (cookieBuilder.length() > 0) cookieBuilder.append("; ");
+                cookieBuilder.append(pair);
+            }
+        }
+        return cookieBuilder.length() > 0 ? cookieBuilder.toString() : null;
+    }
+
+    /**
+     * 从跨域登录地址（data.url）的查询参数里提取 B站登录 Cookie。
+     * 形如 …/crossDomain?DedeUserID=xx&DedeUserID__ckMd5=yy&SESSDATA=zz&bili_jct=ww&gourl=…
+     */
+    private String extractBiliCookieFromUrl(String url) {
+        if (url == null || url.isEmpty()) return null;
+        int q = url.indexOf('?');
+        if (q < 0) return null;
+        StringBuilder cookieBuilder = new StringBuilder();
+        for (String pair : url.substring(q + 1).split("&")) {
+            int eq = pair.indexOf('=');
+            if (eq <= 0) continue;
+            if (isBiliLoginCookie(pair.substring(0, eq).trim())) {
+                if (cookieBuilder.length() > 0) cookieBuilder.append("; ");
+                cookieBuilder.append(pair.trim());
             }
         }
         return cookieBuilder.length() > 0 ? cookieBuilder.toString() : null;

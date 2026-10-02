@@ -60,18 +60,56 @@ public class SearchScreen extends Screen {
         }
     }
 
+    /** 搜索无响应兜底时长：服务端不回包（音源超时/被指令拦截/权限不足）时不能永远卡在“搜索中” */
+    private static final long SEARCH_TIMEOUT_MS = 15_000;
+
     // 由网络线程写入，渲染线程读取
     public static volatile List<SearchEntry> lastResults = new ArrayList<>();
     public static volatile boolean searching = false;
+    /** 本次搜索/点歌请求的发起时刻，用于超时兜底 */
+    private static volatile long searchStartedAt = 0;
+    /** 上次搜索是否因超时收场（仅用于提示文案） */
+    private static volatile boolean searchTimedOut = false;
+    /** 本机刚点的那首歌的 songId，等待服务端 PLAY 包回执（曲名会重名、B站分P的曲名还与详情不同，所以用 ID） */
+    private static volatile String pendingSongId = null;
 
     public static void onResults(List<SearchEntry> list) {
         lastResults = list != null ? list : new ArrayList<>();
         searching = false;
+        searchStartedAt = 0;
     }
 
     public static void onSearching() {
         lastResults = new ArrayList<>();
         searching = true;
+        searchStartedAt = System.currentTimeMillis();
+        searchTimedOut = false;
+    }
+
+    /**
+     * 登记「本机刚刚点了这首歌」。
+     * PLAY 包是广播给全服的，只有本机刚点过的那首才该把搜索界面关掉，
+     * 否则别人点歌会把正在搜索的人从界面里踢出去。
+     *
+     * 登记一直有效，直到被这首歌的 PLAY 消费、或被下一次点歌覆盖 ——
+     * 不能按时间过期：队列里已有歌在放时，新点的歌可能几分钟后才开始播
+     * （B站转码模式解析本身也可能超过十几秒），过期就永远等不到回执、界面不自动关。
+     */
+    public static void expectPlaying(String songId) {
+        pendingSongId = songId;
+    }
+
+    /**
+     * PLAY 包到达时调用：判断这首是不是本机刚点的那首（是则消费掉登记）
+     */
+    public static boolean consumeExpected(String songId) {
+        String expected = pendingSongId;
+        if (expected == null || expected.isEmpty() || songId == null || songId.isEmpty()) return false;
+        if (expected.equals(songId)) {
+            pendingSongId = null;
+            return true;
+        }
+        return false;
     }
 
     private TextFieldWidget searchField;
@@ -191,7 +229,10 @@ public class SearchScreen extends Screen {
             return;
         }
         // 普通结果：点击即点歌（/mm select 用服务端缓存的搜索结果）
-        sendCommand("mm select " + (idx + 1));
+        expectPlaying(e.songId); // 记下期望的 songId，只有它回执时才自动关界面
+        // 带上 songId：服务端会核对缓存里第 N 条是否还是这一首，
+        // 期间若有人 /mm play 顶掉了缓存就明确报错，而不是点错歌
+        sendCommand("mm select " + (idx + 1) + " " + e.songId);
     }
 
     private void sendCommand(String command) {
@@ -219,6 +260,14 @@ public class SearchScreen extends Screen {
 
     @Override
     public void render(DrawContext context, int mouseX, int mouseY, float delta) {
+        // 搜索超时兜底：服务端一个包都不回时（音源卡住/没有权限/指令被别的插件拦掉），
+        // 不能把界面永远钉死在“搜索中”——否则输入框还在，再点搜索也不会发出请求。
+        if (searching && searchStartedAt > 0
+                && System.currentTimeMillis() - searchStartedAt > SEARCH_TIMEOUT_MS) {
+            searchTimedOut = true;
+            onResults(null);
+        }
+
         List<SearchEntry> display = lastResults;
         boolean isLoading = searching;
 
@@ -261,12 +310,15 @@ public class SearchScreen extends Screen {
 
         context.drawCenteredTextWithShadow(textRenderer, title, width / 2, 10, 0xFFFFFF);
 
-        // 状态文案（搜索中 / 无结果提示）
+        // 状态文案（搜索中 / 超时 / 无结果提示）
         if (isLoading) {
             context.drawCenteredTextWithShadow(textRenderer, Text.literal("§7搜索中..."), width / 2, ROWS_TOP + 10, 0xAAAAAA);
         } else if (total == 0) {
-            context.drawCenteredTextWithShadow(textRenderer,
-                    Text.literal("§8输入关键词后点「搜索」，结果显示在这里"), width / 2, ROWS_TOP + 10, 0x888888);
+            Text hint = searchTimedOut
+                    ? Text.literal("§c搜索超时，请重试（或换一个音源）")
+                    : Text.literal("§8输入关键词后点「搜索」，结果显示在这里");
+            context.drawCenteredTextWithShadow(textRenderer, hint, width / 2, ROWS_TOP + 10,
+                    searchTimedOut ? 0xFF5555 : 0x888888);
         }
 
         // 页码指示

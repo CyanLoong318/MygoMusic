@@ -38,7 +38,8 @@ public class AudioPlayer {
     private final ClientConfig config;
     private final AudioCache cache;
 
-    private SourceDataLine currentLine;
+    /** 播放线程写、主线程(stop/pause/resume)读，必须 volatile 才能保证可见性 */
+    private volatile SourceDataLine currentLine;
     private AtomicBoolean playing = new AtomicBoolean(false);
     private AtomicBoolean paused = new AtomicBoolean(false);
     private AtomicInteger volume = new AtomicInteger(80);
@@ -58,7 +59,8 @@ public class AudioPlayer {
     private String currentSource;
     private long currentDuration;
     private long playbackStartTime;
-    private long playbackPosition;
+    /** 播放线程写、渲染线程(HUD/歌词)读，必须 volatile */
+    private volatile long playbackPosition;
 
     public AudioPlayer(ClientConfig config) {
         this.config = config;
@@ -90,6 +92,18 @@ public class AudioPlayer {
      * @param source 音源标识（bilibili/kugou/netease），用于选择正确的请求头与缓存策略
      */
     public void play(String url, String title, String artist, long duration, String source) {
+        play(url, title, artist, duration, source, -1L, false);
+    }
+
+    /**
+     * 播放音频（切歌/新歌会自动取消暂停状态）
+     *
+     * @param playbackId     服务端下发的播放代次，播完回执原样带回（服务端据此丢弃迟到的旧信号）
+     * @param joinInProgress 本机是中途加入（服务端补发的当前歌曲）：从头播放但**不要**回发
+     *                       「已播完」—— 本机比全服晚开始，回发会把这首歌提前切掉
+     */
+    public void play(String url, String title, String artist, long duration, String source,
+                     long playbackId, boolean joinInProgress) {
         stop(); // 内部会 generation++ 并使旧解码线程失效
 
         this.currentTitle = title;
@@ -97,14 +111,18 @@ public class AudioPlayer {
         this.currentSource = source == null ? "" : source;
         this.currentDuration = duration;
         this.playbackPosition = 0;
+        // 先清成当前时刻，避免「本首歌一帧都没解出来」时 effectivePositionMs 拿上一首的旧时间原点算出离谱进度
+        this.playbackStartTime = System.currentTimeMillis();
         paused.set(false);
         pausedAtMs = -1;
         pauseTotalMs.set(0);
 
-        final int myEpoch = generation; // play() 已调 stop() 自增，取当前代际
+        // play() 已调 stop() 自增，取当前代际；代次/回执信息随线程固定下来，
+        // 之后 play() 再被调用也只是换新线程，不会影响本线程的判断
+        final PlaySession session = new PlaySession(generation, playbackId, joinInProgress);
         playThread = new Thread(() -> {
             try {
-                playAudio(url, myEpoch);
+                playAudio(url, session);
             } catch (Exception e) {
                 logger.error("播放失败: " + e.getMessage(), e);
             }
@@ -114,17 +132,26 @@ public class AudioPlayer {
     }
 
     /**
-     * 播放音频（携带本线程代际号，用于失效保护）
+     * 一次播放的会话标识
+     *
+     * @param epoch          代际号：与 {@link #generation} 不等即表示本线程已作废（被切歌/停止）
+     * @param playbackId     服务端播放代次，播完回执原样带回
+     * @param suppressFinish 不回发「已播完」（中途加入的歌由服务端自己按时长切）
      */
-    private void playAudio(String url, int myEpoch) throws Exception {
-        if (myEpoch != generation) return;
+    private record PlaySession(int epoch, long playbackId, boolean suppressFinish) {}
+
+    /**
+     * 播放音频（携带本线程会话标识，用于失效保护）
+     */
+    private void playAudio(String url, PlaySession session) throws Exception {
+        if (session.epoch() != generation) return;
 
         // 检查缓存（是否启用缓存由服务端 client-cache 配置决定）
         if (cache.isEnabled()) {
             File cachedFile = cache.get(url);
             if (cachedFile != null && cachedFile.exists()) {
                 logger.info("使用缓存播放: {}", url);
-                playFile(cachedFile, myEpoch);
+                playFile(cachedFile, session);
                 return;
             }
         }
@@ -147,7 +174,7 @@ public class AudioPlayer {
             pinned.unread(head, 0, n);
 
             PcmFrameSource source = createSource(pinned, head, n, url);
-            playPcm(source, myEpoch);
+            playPcm(source, session);
         }
     }
 
@@ -289,7 +316,7 @@ public class AudioPlayer {
     /**
      * 播放本地文件（缓存命中）
      */
-    private void playFile(File file, int myEpoch) throws Exception {
+    private void playFile(File file, PlaySession session) throws Exception {
         try (InputStream stream = new FileInputStream(file)) {
             PushbackInputStream in = new PushbackInputStream(new BufferedInputStream(stream, 64 * 1024), 32);
             byte[] head = new byte[12];
@@ -300,7 +327,7 @@ public class AudioPlayer {
             }
             in.unread(head, 0, n);
             PcmFrameSource source = createSource(in, head, n, file.getName());
-            playPcm(source, myEpoch);
+            playPcm(source, session);
         }
     }
 
@@ -310,30 +337,32 @@ public class AudioPlayer {
      * 暂停处理：暂停时不读取下一帧，仅阻塞等待，从而保持播放位置（不会静默快进或跑完触发切歌）。
      * 代际保护：只有本线程代际仍等于当前 generation 时才允许清理共享播放状态。
      */
-    private void playPcm(PcmFrameSource source, int myEpoch) throws Exception {
+    private void playPcm(PcmFrameSource source, PlaySession session) throws Exception {
         SourceDataLine line = null;
         int totalFrames = 0;
 
-        if (myEpoch != generation) {
+        if (session.epoch() != generation) {
             source.close();
             return;
         }
 
         playing.set(true);
-        playbackStartTime = System.currentTimeMillis();
-        pauseTotalMs.set(0);
+        // 起播时间留到「第一帧真正写进输出线」时才记账（见下面的 started）：
+        // 打开输出设备 + 等首个数据包可能耗时数秒，若在这里就起算，
+        // 歌词和进度会整体跑在声音前面，越到后面偏得越多。
+        boolean started = false;
 
         try {
-            while (playing.get() && myEpoch == generation) {
+            while (playing.get() && session.epoch() == generation) {
                 // 暂停：阻塞等待恢复，期间不消费网络流
-                while (paused.get() && playing.get() && myEpoch == generation) {
+                while (paused.get() && playing.get() && session.epoch() == generation) {
                     try {
                         Thread.sleep(50);
                     } catch (InterruptedException e) {
                         break; // stop()/切歌中断本线程 → 由外层条件退出
                     }
                 }
-                if (!playing.get() || myEpoch != generation) break;
+                if (!playing.get() || session.epoch() != generation) break;
 
                 PcmFrame frame = source.next();
                 if (frame == null) break; // 自然 EOF（暂停状态下到不了这里）
@@ -348,7 +377,7 @@ public class AudioPlayer {
                         return;
                     }
                     line.start();
-                    if (myEpoch != generation) {
+                    if (session.epoch() != generation) {
                         // 等待输出线打开期间已被切歌，只关本地 line，不污染共享状态
                         try { line.stop(); line.close(); } catch (Exception ignored) {}
                         return;
@@ -363,13 +392,24 @@ public class AudioPlayer {
                 byte[] pcm = shortToBytes(frame.samples());
                 line.write(pcm, 0, pcm.length);
 
+                if (!started) {
+                    // 声音此刻才真正开始出：进度/歌词的时间原点定在这里
+                    started = true;
+                    playbackStartTime = System.currentTimeMillis();
+                    pauseTotalMs.set(0);
+                    // 只清「暂停起点」本身，若这期间已经暂停过则不能把标志也清掉
+                    if (!paused.get()) {
+                        pausedAtMs = -1;
+                    }
+                }
+
                 totalFrames++;
                 playbackPosition = effectivePositionMs(System.currentTimeMillis());
             }
 
             long elapsedSec = (System.currentTimeMillis() - playbackStartTime - pauseTotalMs.get()) / 1000;
 
-            if (myEpoch != generation) {
+            if (session.epoch() != generation) {
                 // 已被切歌/停止：本线程属旧歌，不做清理（共享状态归新线程/已停止）
             } else if (!playing.get()) {
                 // 用户主动停止/切歌
@@ -382,9 +422,11 @@ public class AudioPlayer {
                     // 等待剩余缓冲播完
                     line.drain();
                     logger.info("播放结束: 共解码 {} 帧, 约 {} 秒", totalFrames, elapsedSec);
-                    // 播放自然结束 → 通知服务端切下一首（服务端定时器作兜底）
-                    if (playing.get() && myEpoch == generation && !paused.get()) {
-                        ChannelHandler.notifySongFinished();
+                    // 播放自然结束 → 通知服务端切下一首（服务端定时器作兜底）。
+                    // 带回 playbackId：全服已切到下一首时服务端会丢弃这条迟到回执。
+                    // suppressFinish：本机是中途进服补发的歌，不能代表全服「播完了」。
+                    if (playing.get() && session.epoch() == generation && !paused.get() && !session.suppressFinish()) {
+                        ChannelHandler.notifySongFinished(session.playbackId());
                     }
                 }
             } else {
@@ -401,7 +443,7 @@ public class AudioPlayer {
                 } catch (Exception ignored) {}
             }
             // 仅当前代际允许清共享状态；旧代际线程绝不动新歌的 playing/currentLine
-            if (myEpoch == generation) {
+            if (session.epoch() == generation) {
                 playing.set(false);
                 currentLine = null;
             }
@@ -533,10 +575,22 @@ public class AudioPlayer {
 
     /**
      * 暂停（幂等）
+     *
+     * 只 stop 不 flush：flush 会把输出线里已写入却还没播出的 PCM 直接丢掉，
+     * 每次暂停都静默跳过这段音乐（约一个输出缓冲区），且这段内容再也补不回来。
+     * stop() 会立刻停住渲染，缓冲数据保留，resume() 时从断点接着放，一分不丢。
      */
     public void pause() {
         if (paused.compareAndSet(false, true)) {
             pausedAtMs = System.currentTimeMillis();
+            SourceDataLine line = currentLine;
+            if (line != null) {
+                try {
+                    line.stop();
+                } catch (Exception ignored) {
+                    // line 可能刚被 stop()/切歌关掉
+                }
+            }
         }
     }
 
@@ -550,6 +604,14 @@ public class AudioPlayer {
                 pauseTotalMs.addAndGet(now - pausedAtMs);
             }
             pausedAtMs = -1;
+            SourceDataLine line = currentLine;
+            if (line != null) {
+                try {
+                    line.start(); // 与 pause() 的 stop() 配对，重新开始出声
+                } catch (Exception ignored) {
+                    // line 可能刚被 stop()/切歌关掉
+                }
+            }
         }
     }
 

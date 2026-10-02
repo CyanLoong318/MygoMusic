@@ -99,13 +99,12 @@ https://github.com/FrecklyComb1728/BiliParser
 
 | 命令 | 说明 |
 |------|------|
-| `/mm play <歌名>` | 搜索并点歌 |
-| `/mm play <歌名> -s <音源>` | 指定音源点歌 |
-| `/mm play bilibili <BV号>` | B站 BV 号直达（支持 `p2` 指定分P） |
+| `/mm play <音源> <歌名> [玩家名]` | 搜索并点歌（音源必填：`netease`/`kugou`/`bilibili`） |
+| `/mm play bilibili <BV号> [p2]` | B站 BV 号直达，`p2` 指定分P（也可写 `BV号 p2`） |
 | `/mm playid <平台> <ID>` | 通过歌曲 ID 点歌 |
 | `/mm select <序号>` | 选择搜索结果 |
-| `/mm searchparts <片段>` | 按片段搜索 |
-| `/mm search <歌名>` | 搜索歌曲 |
+| `/mm searchparts <BV号>` | 列出该视频的全部分P |
+| `/mm search <音源> <歌名>` | 搜索歌曲（音源必填） |
 | `/mm stop` | 停止播放 |
 | `/mm pause` | 暂停播放（**全服同步**：所有玩家一起暂停） |
 | `/mm continue` | 继续播放（全服暂停中恢复同一首；停止后则从队列继续） |
@@ -114,8 +113,8 @@ https://github.com/FrecklyComb1728/BiliParser
 | `/mm remove <序号>` | 从等待队列移除歌曲（仅限自己点的，管理员可移任意；序号同 GUI 播放队列的 `#N`） |
 | `/mm queue` | 查看队列 |
 | `/mm now` | 查看当前播放 |
-| `/mm volume <0-100>` | 调整音量 |
-| `/mm lyrics` | 开关歌词 |
+| `/mm volume <0-100>` | 调整**自己**的音量（需装客户端 Mod；音频在客户端播放，服务端只能把音量下发过去） |
+| `/mm lyrics [on\|off]` | 开关**自己**的歌词显示（不带参数则切换；同样需客户端 Mod） |
 | `/mm login <平台> <cookie>` | 登录平台账号 |
 | `/mm logout <平台>` | 登出平台账号 |
 
@@ -206,16 +205,21 @@ ffmpeg:
 ```json
 {
   "volume": 80,
-  "mute": false,
   "lyricsEnabled": true,
-  "lyricsPosition": "actionbar",
   "showTranslation": true,
-  "lyricsScale": 1.0,
-  "hudEnabled": true,
-  "hudX": 10,
-  "hudY": 10
+  "lyricsOffsetX": 0,
+  "lyricsOffsetY": 0
 }
 ```
+
+| 字段 | 说明 |
+|------|------|
+| `volume` | 本机音量 0-100（`/mm volume` 与客户端设置界面都会写这里） |
+| `lyricsEnabled` | 是否显示歌词（`/mm lyrics` 也改这个） |
+| `showTranslation` | 外文歌词是否显示译文 |
+| `lyricsOffsetX` / `lyricsOffsetY` | 歌词相对默认位置（屏幕水平居中、底部偏上约 58px）的像素偏移，正数=右/下 |
+
+> 该文件由客户端自动生成与维护；存档里若残留 `mute`/`lyricsPosition`/`lyricsScale`/`hudEnabled`/`hudX`/`hudY` 等旧键，加载时会被忽略。
 
 ## 🔌 权限节点
 
@@ -228,8 +232,7 @@ ffmpeg:
 | `mygomusic.volume` | 允许调整音量 | true |
 | `mygomusic.lyrics` | 允许开关歌词 | true |
 | `mygomusic.login` | 允许登录平台 | true |
-| `mygomusic.nocooldown` | 免点歌冷却 | false |
-| `mygomusic.queuelimit` | 队列优先（可多首） | false |
+| `mygomusic.nocooldown` | 免点歌冷却（`/mm play`、`/mm select`、`/mm playid` 通用） | false |
 | `mygomusic.admin` | 管理员命令 | op |
 
 ## 📈 PlaceholderAPI 变量

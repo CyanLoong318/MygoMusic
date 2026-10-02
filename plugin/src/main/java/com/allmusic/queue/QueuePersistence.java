@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -23,6 +24,8 @@ import java.util.UUID;
 public class QueuePersistence {
     private static final Logger logger = LoggerFactory.getLogger("MygoMusic-Persistence");
     private static final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+    /** 最多保留几份关服队列快照（供 /mm admin restore 使用） */
+    private static final int KEEP_QUEUE_FILES = 10;
 
     private final AllMusicPlugin plugin;
     private final PlayQueue playQueue;
@@ -42,8 +45,8 @@ public class QueuePersistence {
         // 检查是否有未恢复的队列文件
         File[] files = historyDir.listFiles((dir, name) -> name.startsWith("queue_") && name.endsWith(".json"));
         if (files != null && files.length > 0) {
-            logger.info("发现 {} 个未恢复的队列文件", files.length);
-            // 不自动恢复，等待OP手动恢复
+            // 不自动恢复（避免上线就把上次的队列灌进来），由 OP 手动执行
+            logger.info("发现 {} 个未恢复的队列快照，可用 /mm admin restore 恢复最近一份", files.length);
         }
     }
 
@@ -98,6 +101,9 @@ public class QueuePersistence {
             }
 
             logger.info("队列已保存到: {}", saveFile.getName());
+            // 顺带清理：每次关服都会落一份文件，不限制的话目录会一直涨。
+            // （这个清理方法原来写好了却没人调用）
+            cleanOldFiles(KEEP_QUEUE_FILES);
         } catch (Exception e) {
             logger.error("保存队列失败: " + e.getMessage(), e);
         }
@@ -108,6 +114,19 @@ public class QueuePersistence {
      */
     public boolean restore(String fileName) {
         File file = new File(historyDir, fileName);
+        // 防目录穿越：fileName 来自命令参数（/mm admin restore <文件名>），可能是 ../ 开头的任意路径。
+        // 解析真实路径后必须仍在 queue_history 内，否则会清空队列并误删队列之外的无关文件。
+        try {
+            Path base = historyDir.getCanonicalFile().toPath();
+            Path target = file.getCanonicalFile().toPath();
+            if (!target.startsWith(base)) {
+                logger.warn("拒绝恢复越界路径: {}", fileName);
+                return false;
+            }
+        } catch (IOException e) {
+            logger.warn("恢复路径解析失败: {} ({})", fileName, e.getMessage());
+            return false;
+        }
         if (!file.exists()) {
             return false;
         }
@@ -133,6 +152,31 @@ public class QueuePersistence {
                             itemJson.has("addedAt") ? itemJson.get("addedAt").getAsLong() : System.currentTimeMillis()
                     );
                     items.add(item);
+                }
+            }
+
+            // 关服时正在播放的那首不在等待队列里（放完才会再入队），但被单独保存过；
+            // 恢复时把它插回队首，避免「恢复成功但正在播的那首凭空消失」。
+            if (root.has("currentPlaying") && root.get("currentPlaying").isJsonObject()) {
+                try {
+                    JsonObject cur = root.getAsJsonObject("currentPlaying");
+                    UUID requesterUuid;
+                    try {
+                        requesterUuid = UUID.fromString(cur.get("requesterUuid").getAsString());
+                    } catch (Exception ignore) {
+                        requesterUuid = new UUID(0L, 0L); // 点歌人信息缺失时用零 UUID 占位
+                    }
+                    QueueItem current = new QueueItem(
+                            cur.get("songId").getAsString(),
+                            cur.get("title").getAsString(),
+                            cur.get("artist").getAsString(),
+                            cur.get("source").getAsString(),
+                            cur.has("requesterName") ? cur.get("requesterName").getAsString() : "?",
+                            requesterUuid,
+                            System.currentTimeMillis());
+                    items.add(0, current);
+                } catch (Exception e) {
+                    logger.warn("跳过无法恢复的正在播放记录: {}", e.getMessage());
                 }
             }
 

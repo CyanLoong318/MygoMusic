@@ -105,20 +105,27 @@ public class PrefetchStream extends InputStream {
                 if (n < 0) {
                     // 提前结束（CDN 悄悄掐连接时 read 会返回 -1 而不是抛异常）：
                     // 已下载的字节数对不上总长度就按断线处理，续传接着下，别当成播完了
-                    if (isIncomplete() && !closed.get() && retries < MAX_RETRIES && reopener != null
-                            && totalFetched > 0) {
-                        retries++;
-                        logger.warn("音频流提前结束({}/{} 字节)，尝试续传({}/{})",
-                                totalFetched, expectedLength, retries, MAX_RETRIES);
-                        try {
-                            net = reopener.open(totalFetched);
-                            netRef = net;
-                            continue;
-                        } catch (IOException reopenError) {
-                            logger.warn("续传失败: {}", reopenError.getMessage());
+                    if (isIncomplete() && !closed.get()) {
+                        if (retries < MAX_RETRIES && reopener != null && totalFetched > 0) {
+                            retries++;
+                            logger.warn("音频流提前结束({}/{} 字节)，尝试续传({}/{})",
+                                    totalFetched, expectedLength, retries, MAX_RETRIES);
+                            try {
+                                net = reopener.open(totalFetched);
+                                netRef = net;
+                                continue;
+                            } catch (IOException reopenError) {
+                                logger.warn("续传失败: {}", reopenError.getMessage());
+                            }
                         }
+                        // 续传不可用/次数用尽：必须如实报错。
+                        // 若在这里静静地 break（旧行为），上层会把「被截断的流」当成正常播完，
+                        // 于是通知服务端切下一首 —— 表现就是歌听到一半莫名跳歌，且半截文件还会被写进缓存。
+                        failure = new IOException("音频流不完整: 已下载 " + totalFetched
+                                + " / " + expectedLength + " 字节");
+                        logger.warn("{}", failure.getMessage());
                     }
-                    break; // 正常结束
+                    break; // 已置 failure 或正常结束（读完/被 close）
                 }
                 if (n == 0) continue;
 
@@ -134,8 +141,11 @@ public class PrefetchStream extends InputStream {
                 queue.put(chunk);
             }
 
-            // 完整下完才让缓存生效（中途失败/被切歌的截断文件由 close() abort 掉）
-            if (cacheWriter != null && !closed.get() && failure == null && !isIncomplete()) {
+            // 完整下完才让缓存生效（中途失败/被切歌的截断文件由 close() abort 掉）。
+            // expectedLength < 0（CDN 没给 Content-Length）时无法识别「被掐断的假 EOF」，
+            // 宁可不缓存，也不要把半截文件当完整缓存落盘。
+            if (cacheWriter != null && !closed.get() && failure == null
+                    && !isIncomplete() && expectedLength >= 0) {
                 cacheWriter.commit();
             }
         } catch (InterruptedException e) {

@@ -400,6 +400,13 @@ public class BilibiliM4sSource implements PcmFrameSource {
 
                 long runBytes = 0;
                 for (long i = 0; i < count; i++) {
+                    // 先算出本样本要占几个字节、检查过界再读：
+                    // 旧代码是先 u32(d,p) 读完再检查 p > trun.end，越界那一次读到的其实是
+                    // 紧邻盒子的字节（结果不可知），运气差就解析出一个荒谬的样本大小。
+                    int needed = (hasDuration ? 4 : 0) + (hasSize ? 4 : 0)
+                            + (hasFlags ? 4 : 0) + (hasCto ? 4 : 0);
+                    if (p + needed > trun.end) throw new IOException("trun 样本表越界");
+
                     if (hasDuration) p += 4;
                     int size;
                     if (hasSize) {
@@ -410,7 +417,6 @@ public class BilibiliM4sSource implements PcmFrameSource {
                     }
                     if (hasFlags) p += 4;
                     if (hasCto) p += 4;
-                    if (p > trun.end) throw new IOException("trun 样本表越界");
                     if (size <= 0) throw new IOException("样本大小为 0（无法定位音频数据）");
                     spec.sizes.add(size);
                     runBytes += size;

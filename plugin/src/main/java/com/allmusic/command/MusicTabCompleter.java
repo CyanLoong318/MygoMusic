@@ -21,7 +21,8 @@ public class MusicTabCompleter implements TabCompleter {
 
     private static final List<String> MAIN_COMMANDS = Arrays.asList(
             "play", "playid", "pause", "stop", "continue", "next", "prev", "remove",
-            "queue", "search", "now", "volume", "lyrics", "login", "logout", "admin", "select"
+            "queue", "search", "searchparts", "now", "volume", "lyrics", "login", "logout",
+            "admin", "select"
     );
 
     private static final List<String> ADMIN_COMMANDS = Arrays.asList(
@@ -58,6 +59,12 @@ public class MusicTabCompleter implements TabCompleter {
                 case "volume":
                     // 返回音量值
                     return filterCompletions(Arrays.asList("0", "25", "50", "75", "100"), args[1]);
+                case "lyrics":
+                    // /mm lyrics [on|off]
+                    return filterCompletions(Arrays.asList("on", "off"), args[1]);
+                case "searchparts":
+                    // 参数是 BV 号，没法补全
+                    return new ArrayList<>();
                 case "remove":
                     // 返回队列序号（1-10，供参考）
                     return filterCompletions(Arrays.asList("1", "2", "3", "4", "5", "6", "7", "8", "9", "10"), args[1]);

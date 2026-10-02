@@ -78,29 +78,46 @@ public class QueueScheduler {
             return;
         }
         if (!playQueue.isPlaying()) {
-            // 没有正在播放的歌曲，尝试从队列取下一首
-            if (configManager.isAutoPlay() && !playQueue.isEmpty()) {
+            // 没有正在播放的歌曲，尝试从队列取下一首。
+            // 但「用户主动 /mm stop」之后必须真的停住：旧行为是照常续播，
+            // 于是 /mm stop 一秒后自动开下一首，实际效果等于 /mm next。
+            if (!autoAdvanceSuspended && configManager.isAutoPlay() && !playQueue.isEmpty()) {
                 playNext();
             }
         } else {
-            // 检查当前歌曲是否播放完毕
-            if (playQueue.isPlaybackFinished()) {
-                logger.info("歌曲播放完毕");
-                playQueue.stop();
-
-                // 同步队列状态到客户端 GUI
-                PluginChannel channel = plugin.getPluginChannel();
-                if (channel != null) {
-                    channel.broadcastQueueSync();
-                }
-
-                // 自动播放下一首
-                if (configManager.isAutoPlay() && !playQueue.isEmpty()) {
-                    playNext();
-                }
+            // 检查当前歌曲是否播放完毕（带宽容，避免服务端时钟比客户端实际出声快而削掉歌尾）
+            if (playQueue.isPlaybackFinished(PlayQueue.SERVER_CLOCK_GRACE_MS)) {
+                completeCurrentSong();
             }
         }
     }
+
+    /**
+     * 当前歌曲正常播完：停播 + 同步 GUI；是否自动续播由 queue.auto-play 决定。
+     * 定时器（服务端按时长判断）与客户端「已播完」信号共用这一条收尾路径，
+     * 保证两条路的行为一致 —— 尤其是 auto-play=false 时两条路都不许自动开下一首。
+     */
+    private void completeCurrentSong() {
+        logger.info("歌曲播放完毕");
+        playQueue.stop();
+
+        // 同步队列状态到客户端 GUI
+        PluginChannel channel = plugin.getPluginChannel();
+        if (channel != null) {
+            channel.broadcastQueueSync();
+        }
+
+        // 自动播放下一首
+        if (configManager.isAutoPlay() && !playQueue.isEmpty()) {
+            playNext();
+        }
+    }
+
+    /**
+     * 用户主动停止后置位：抑制 tick 的「队列非空就自动开下一首」。
+     * 任何显式的开始播放动作（/mm continue、next、prev、点歌）都会解除它。
+     */
+    private volatile boolean autoAdvanceSuspended = false;
 
     /** 是否有一次"取歌→获取详情→开始播放"流程正在进行中（防止重复取歌） */
     private final AtomicBoolean picking = new AtomicBoolean(false);
@@ -172,24 +189,41 @@ public class QueueScheduler {
     }
 
     /**
-     * 客户端确认当前歌曲播放完毕时调用：停止当前并切下一首。
-     * 与定时器完成路径一致；picking 原子锁防止二者并发重复。
+     * 客户端确认当前歌曲播放完毕时调用：停止当前并按 auto-play 决定是否切下一首。
+     *
+     * @param playbackId 客户端回带的服务端播放代次。PLAY 是广播包，全服每个装了 Mod 的客户端
+     *                   都会在各自听完整首后回一个「已播完」；若这时全服已经切到下一首
+     *                   （服务端按长度先切、或别的客户端先发、或刚有人 /mm next），
+     *                   没有这层代次校验就会把正在播的新歌停掉再跳一首（表现为莫名跳歌）。
+     *                   -1 = 旧客户端（包里没有代次），只当冗余触发，仍以服务端自身判断为准。
      */
-    public void onSongFinishedByClient() {
+    public void onSongFinishedByClient(long playbackId) {
         // 全服暂停期间不收“已播完”信号，避免迟到 EOF 跳歌
         if (playQueue.isPaused()) {
             return;
         }
-        if (playQueue.isPlaying()) {
-            playQueue.stop();
+        if (!playQueue.isPlaying()) {
+            return; // 已经停了/正在取下一首：本信号无需处理
         }
-        playNext();
+        if (playbackId >= 0) {
+            if (playbackId != playQueue.getPlaybackId()) {
+                logger.debug("忽略迟到的「已播完」信号: 信号代次={}, 当前代次={}", playbackId, playQueue.getPlaybackId());
+                return;
+            }
+        } else if (!playQueue.isPlaybackFinished()) {
+            // 旧客户端不带代次：无法分辨它说的是哪一首，只采信「服务端自己也认为该切了」的情况
+            logger.debug("忽略旧客户端不带代次的「已播完」信号，等待服务端时长判定");
+            return;
+        }
+        completeCurrentSong();
     }
 
     /**
      * 播放下一首
      */
     public boolean playNext() {
+        // 显式要求播下一首 = 用户要继续听，解除「主动停止」的抑制
+        autoAdvanceSuspended = false;
         if (!picking.compareAndSet(false, true)) {
             logger.debug("正在切换歌曲中，忽略本次 playNext 调用");
             return false;
@@ -207,6 +241,7 @@ public class QueueScheduler {
      * 播放上一首 (从历史中取)
      */
     public boolean playPrevious() {
+        autoAdvanceSuspended = false; // 同 playNext：显式操作即恢复自动续播
         if (!picking.compareAndSet(false, true)) {
             return false;
         }
@@ -399,6 +434,19 @@ public class QueueScheduler {
         }
 
         logger.info("正在播放: {} - {} ({})", detail.getTitle(), detail.getArtist(), detail.getSource());
+    }
+
+    /**
+     * 用户显式停止（/mm stop、/mm admin stop）：停止当前播放，并抑制自动续播。
+     *
+     * 不做抑制的话，tick() 下一秒就会因为「没在播 + 队列非空」把下一首自动开起来，
+     * 玩家看到的 /mm stop 实际是 /mm next。要恢复播放得用 /mm continue 或再点一首。
+     * 同时在途的取歌任务也一并取消 —— 否则它取完照样会把歌播出来，看起来像停止无效。
+     */
+    public void stopByUser() {
+        autoAdvanceSuspended = true;
+        cancelFetch();
+        stopCurrent();
     }
 
     /**

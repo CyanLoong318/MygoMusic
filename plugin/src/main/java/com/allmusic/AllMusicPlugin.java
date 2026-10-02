@@ -27,6 +27,7 @@ public class AllMusicPlugin extends JavaPlugin {
     private PluginChannel pluginChannel;
     private DatabaseManager databaseManager;
     private HttpFileServer httpFileServer;
+    private MusicCommand musicCommand;
 
     @Override
     public void onEnable() {
@@ -56,6 +57,11 @@ public class AllMusicPlugin extends JavaPlugin {
             // 初始化 Plugin Messaging
             pluginChannel = new PluginChannel(this, queueScheduler);
 
+            // 启动队列调度器：每秒 tick —— 取歌看门狗（防止一次卡死的取歌把整队拖停）、
+            // 按时长判断歌曲播完并续播、时长未知时 15 分钟兜底切歌。
+            // 没有这一步，调度器一次都不会跑（这些兜底全是死代码）。
+            queueScheduler.start();
+
             // 启动 HTTP 文件服务器（用于 B站转码后的 MP3）
             // 直链模式下也保留：视频只有 HE-AAC/杜比/无损音轨时会回退到转码分发
             httpFileServer = new HttpFileServer();
@@ -71,7 +77,8 @@ public class AllMusicPlugin extends JavaPlugin {
             }
 
             // 注册命令
-            getCommand("mm").setExecutor(new MusicCommand(this, sourceManager, playQueue, queueScheduler, pluginChannel, configManager, databaseManager));
+            musicCommand = new MusicCommand(this, sourceManager, playQueue, queueScheduler, pluginChannel, configManager, databaseManager);
+            getCommand("mm").setExecutor(musicCommand);
             getCommand("mm").setTabCompleter(new MusicTabCompleter(sourceManager));
 
             // 注册 Plugin Messaging Channel
@@ -84,10 +91,17 @@ public class AllMusicPlugin extends JavaPlugin {
             // 注册 PlaceholderAPI 扩展
             if (getServer().getPluginManager().getPlugin("PlaceholderAPI") != null) {
                 try {
-                    Class.forName("com.allmusic.placeholder.AllMusicExpansion")
+                    Object expansion = Class.forName("com.allmusic.placeholder.AllMusicExpansion")
                             .getDeclaredConstructor(AllMusicPlugin.class, PlayQueue.class, QueueScheduler.class)
                             .newInstance(this, playQueue, queueScheduler);
-                    logger.info("PlaceholderAPI 扩展已注册");
+                    // 构造出来只是拿到对象，必须再 register() 才会被 PAPI 收进注册表。
+                    // 旧代码漏了这一步（对象建完就扔），所以 %mygomusic_xxx% 一个都解析不出来。
+                    Object accepted = expansion.getClass().getMethod("register").invoke(expansion);
+                    if (Boolean.FALSE.equals(accepted)) {
+                        logger.warning("PlaceholderAPI 扩展注册被拒绝（标识符可能已被占用）");
+                    } else {
+                        logger.info("PlaceholderAPI 扩展已注册");
+                    }
                 } catch (Exception e) {
                     logger.warning("PlaceholderAPI 扩展注册失败: " + e.getMessage());
                 }
@@ -112,9 +126,20 @@ public class AllMusicPlugin extends JavaPlugin {
                 getServer().getScheduler().runTaskLater(AllMusicPlugin.this, () -> {
                     if (!p.isOnline()) return;
                     if (pluginChannel == null) return;
+                    // 正在播放时补发当前歌曲：玩家是中途进服的，错过了 PLAY 广播，
+                    // 不补发就听不到这首歌、也看不到歌词（旧版本这里只同步了队列状态）
+                    pluginChannel.sendCurrentPlay(p);
                     pluginChannel.sendQueueSync(p);
                     pluginChannel.sendCacheConfig(p);
                 }, 30L);
+            }
+
+            // 退出时清掉该玩家的冷却与搜索结果缓存，避免长期开服后逐人堆积
+            @org.bukkit.event.EventHandler
+            public void onPlayerQuit(org.bukkit.event.player.PlayerQuitEvent event) {
+                if (musicCommand != null) {
+                    musicCommand.clearPlayerCache(event.getPlayer().getUniqueId());
+                }
             }
         }, this);
     }
@@ -123,8 +148,8 @@ public class AllMusicPlugin extends JavaPlugin {
     public void onDisable() {
         logger.info("MygoMusic 正在关闭...");
 
-        // 保存队列到文件
-        if (queuePersistence != null) {
+        // 保存队列到文件（queue.save-on-shutdown 配置此前完全没被读过）
+        if (queuePersistence != null && configManager.isSaveOnShutdown()) {
             queuePersistence.saveOnShutdown();
         }
 
@@ -184,5 +209,9 @@ public class AllMusicPlugin extends JavaPlugin {
 
     public DatabaseManager getDatabaseManager() {
         return databaseManager;
+    }
+
+    public QueuePersistence getQueuePersistence() {
+        return queuePersistence;
     }
 }

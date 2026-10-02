@@ -6,7 +6,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -15,7 +17,13 @@ import java.util.Map;
  */
 public class SourceManager {
     private static final Logger logger = LoggerFactory.getLogger("MygoMusic-Source");
-    private final Map<String, MusicSource> sources = new HashMap<>();
+
+    /**
+     * 音源表。reload() 是「建新表 → 整体换引用」，不是原地 clear+put：
+     * 旧写法在异步搜索/测试遍历到一半时 clear()，会直接抛 ConcurrentModificationException，
+     * 而且中间还会出现一个「什么都查不到」的空窗期。表本身只读，换引用才安全。
+     */
+    private volatile Map<String, MusicSource> sources = Map.of();
     private final JavaPlugin plugin;
     private final ConfigManager configManager;
 
@@ -26,11 +34,13 @@ public class SourceManager {
     }
 
     private void initializeSources() {
+        Map<String, MusicSource> loaded = new LinkedHashMap<>();
+
         // 初始化网易云音源
         if (configManager.isNeteaseEnabled()) {
             try {
                 NeteaseSource netease = new NeteaseSource();
-                sources.put("netease", netease);
+                loaded.put("netease", netease);
                 restoreCookie(netease, "netease");
                 logger.info("网易云音源已加载");
             } catch (Exception e) {
@@ -42,7 +52,7 @@ public class SourceManager {
         if (configManager.isKugouEnabled()) {
             try {
                 KugouSource kugou = new KugouSource();
-                sources.put("kugou", kugou);
+                loaded.put("kugou", kugou);
                 restoreCookie(kugou, "kugou");
                 logger.info("酷狗音源已加载");
             } catch (Exception e) {
@@ -54,7 +64,7 @@ public class SourceManager {
         if (configManager.isBilibiliEnabled()) {
             try {
                 BilibiliSource bilibili = new BilibiliSource(configManager);
-                sources.put("bilibili", bilibili);
+                loaded.put("bilibili", bilibili);
                 restoreCookie(bilibili, "bilibili");
                 logger.info("B站音源已加载");
             } catch (Exception e) {
@@ -62,7 +72,8 @@ public class SourceManager {
             }
         }
 
-        logger.info("已加载 {} 个音源", sources.size());
+        this.sources = Collections.unmodifiableMap(loaded);
+        logger.info("已加载 {} 个音源", loaded.size());
     }
 
     /**
@@ -149,7 +160,7 @@ public class SourceManager {
     }
 
     public void reload() {
-        sources.clear();
+        // initializeSources() 内部建新表并整体替换引用，无需（也不能）在这里先 clear
         initializeSources();
     }
 }

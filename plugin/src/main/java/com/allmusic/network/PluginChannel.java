@@ -46,6 +46,8 @@ public class PluginChannel implements PluginMessageListener {
     public static final byte PACKET_CACHE_CONFIG = 0x0D;
     // 客户端 → 服务端：请求一次队列状态同步（GUI 打开时主动拉取最新播放/暂停状态）
     public static final byte PACKET_REQUEST_SYNC = 0x0E;
+    // 服务端 → 客户端：设置客户端音量（0-100）。音频在客户端播放，只能靠这个包改音量
+    public static final byte PACKET_SET_VOLUME = 0x0F;
 
     private final AllMusicPlugin plugin;
     private final QueueScheduler queueScheduler;
@@ -73,7 +75,8 @@ public class PluginChannel implements PluginMessageListener {
                     handleSync(player, input);
                     break;
                 case PACKET_SONGFINISHED:
-                    handleSongFinished(player);
+                    // 新客户端在包类型后带 8 字节 playbackId（共 9 字节）；旧客户端只有 1 字节
+                    handleSongFinished(player, message.length >= 9 ? input.readLong() : -1L);
                     break;
                 case PACKET_REQUEST_SYNC:
                     // GUI 打开时主动请求一次最新队列状态（含播放/暂停标志）
@@ -101,12 +104,7 @@ public class PluginChannel implements PluginMessageListener {
      */
     private void handleSync(Player player, ByteArrayDataInput input) {
         // 玩家切服时，发送当前播放状态
-        if (queueScheduler.getPlayQueue().isPlaying()) {
-            SongDetail detail = queueScheduler.getPlayQueue().getCurrentSongDetail();
-            if (detail != null) {
-                sendPlayToPlayer(player, detail);
-            }
-        }
+        sendCurrentPlay(player);
         // 同步客户端缓存设置（加入时客户端也会收到一次，这里兜底再推一次）
         sendCacheConfig(player);
     }
@@ -129,6 +127,36 @@ public class PluginChannel implements PluginMessageListener {
     }
 
     /**
+     * 发送音量设置给指定玩家（0x0F: volume(4)）
+     */
+    public void sendVolume(Player player, int volume) {
+        if (player == null || !player.isOnline()) return;
+        try {
+            ByteArrayDataOutput output = ByteStreams.newDataOutput();
+            output.writeByte(PACKET_SET_VOLUME);
+            output.writeInt(Math.max(0, Math.min(100, volume)));
+            sendPluginMessage(player, output.toByteArray());
+        } catch (Exception e) {
+            logger.error("发送音量设置失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 发送歌词显示开关给指定玩家（0x07: mode(1)，0=切换 1=显示 2=隐藏）
+     */
+    public void sendLyricsToggle(Player player, int mode) {
+        if (player == null || !player.isOnline()) return;
+        try {
+            ByteArrayDataOutput output = ByteStreams.newDataOutput();
+            output.writeByte(PACKET_LYRICS);
+            output.writeByte(mode);
+            sendPluginMessage(player, output.toByteArray());
+        } catch (Exception e) {
+            logger.error("发送歌词开关失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
      * 广播客户端音频缓存设置到所有在线玩家（配置重载后调用）
      */
     public void broadcastCacheConfig() {
@@ -141,8 +169,10 @@ public class PluginChannel implements PluginMessageListener {
 
     /**
      * 客户端确认当前歌曲已播放完毕 → 切下一首（服务端定时器作兜底）
+     *
+     * @param playbackId 客户端回带的播放代次（-1 = 旧客户端未带），用于丢弃迟到的旧信号
      */
-    private void handleSongFinished(Player player) {
+    private void handleSongFinished(Player player, long playbackId) {
         try {
             if (queueScheduler == null) return;
             PlayQueue playQueue = queueScheduler.getPlayQueue();
@@ -151,16 +181,53 @@ public class PluginChannel implements PluginMessageListener {
             if (playQueue.isPaused()) return;
             logger.info("客户端确认歌曲播放完毕(来自 {})，自动切下一首", player.getName());
             // 标记当前结束，触发下一首（picking 原子锁防止与定时器重复）
-            queueScheduler.onSongFinishedByClient();
+            queueScheduler.onSongFinishedByClient(playbackId);
         } catch (Exception e) {
             logger.error("处理客户端播放完成信号失败: " + e.getMessage(), e);
         }
     }
 
     /**
-     * 广播播放歌曲
+     * 广播播放歌曲（新歌开始，各客户端都从头正常播放）
      */
     public void broadcastPlay(SongDetail detail) {
+        byte[] data = buildPlayData(detail, false);
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            if (player.isOnline()) {
+                sendPluginMessage(player, data);
+            }
+        }
+    }
+
+    /**
+     * 把「当前正在播放的歌」补发给某个玩家：玩家中途进服、或从别的子服切过来时，
+     * 他错过了 PLAY 广播，不补发就听不到这首歌也不会显示歌词。
+     * joinInProgress=true：客户端从头播放，但不回发「已播完」信号
+     * （它是中途加入的，播完的时刻比全服晚，回发会把这首歌提前切掉）。
+     */
+    public void sendCurrentPlay(Player player) {
+        if (player == null || !player.isOnline()) return;
+        if (queueScheduler == null) return;
+        PlayQueue playQueue = queueScheduler.getPlayQueue();
+        if (playQueue == null || !playQueue.isPlaying()) return;
+        SongDetail detail = playQueue.getCurrentSongDetail();
+        if (detail == null) return;
+        sendPluginMessage(player, buildPlayData(detail, true));
+        if (playQueue.isPaused()) {
+            // 全服暂停中进服：必须补一个 PAUSE 包。否则该客户端收到 PLAY 就从头出声，
+            // 全服都在暂停、只有他一个人在响（QUEUE_SYNC 里的 paused 只用于界面显示，不会暂停音频）
+            sendPluginMessage(player, new byte[]{PACKET_PAUSE});
+        }
+    }
+
+    /**
+     * 构建 PLAY 包 (0x01)：歌曲信息 + 歌词 + 追加字段。
+     * 追加字段放在末尾（老客户端读到歌词就结束解析，会自然忽略；新客户端读不到则按默认值处理）：
+     *   playbackId(8)    —— 本首歌的播放代次，「已播完」回执原样带回，服务端据此丢弃迟到信号
+     *   joinInProgress(1)—— 该客户端是中途加入（补发），不要回发「已播完」
+     *   songId(str)      —— 供客户端 GUI 核对「这首是不是我刚点的那首」
+     */
+    private byte[] buildPlayData(SongDetail detail, boolean joinInProgress) {
         ByteArrayDataOutput output = ByteStreams.newDataOutput();
         output.writeByte(PACKET_PLAY);
 
@@ -186,45 +253,13 @@ public class PluginChannel implements PluginMessageListener {
             output.writeInt(0);
         }
 
-        // 广播给所有玩家
-        byte[] data = output.toByteArray();
-        for (Player player : Bukkit.getOnlinePlayers()) {
-            if (player.isOnline()) {
-                sendPluginMessage(player, data);
-            }
-        }
-    }
+        // 追加字段（见方法注释）
+        PlayQueue playQueue = queueScheduler != null ? queueScheduler.getPlayQueue() : null;
+        output.writeLong(playQueue != null ? playQueue.getPlaybackId() : -1L);
+        output.writeBoolean(joinInProgress);
+        writeString(output, detail.getSongId() != null ? detail.getSongId() : "");
 
-    /**
-     * 发送播放信息给指定玩家
-     */
-    public void sendPlayToPlayer(Player player, SongDetail detail) {
-        if (!player.isOnline()) return;
-
-        ByteArrayDataOutput output = ByteStreams.newDataOutput();
-        output.writeByte(PACKET_PLAY);
-
-        writeString(output, detail.getTitle());
-        writeString(output, detail.getArtist());
-        output.writeLong(detail.getDuration());
-        writeString(output, detail.getSource());
-        writeString(output, detail.getAudioUrl() != null ? detail.getAudioUrl() : "");
-        writeString(output, detail.getLocalPath() != null ? detail.getLocalPath() : "");
-
-        Lyrics lyrics = detail.getLyrics();
-        if (lyrics != null && !lyrics.isEmpty()) {
-            List<LyricsLine> lines = lyrics.getLines();
-            output.writeInt(lines.size());
-            for (LyricsLine line : lines) {
-                output.writeLong(line.getTimestamp());
-                writeString(output, line.getText());
-                writeString(output, line.hasTranslation() ? line.getTranslation() : "");
-            }
-        } else {
-            output.writeInt(0);
-        }
-
-        sendPluginMessage(player, output.toByteArray());
+        return output.toByteArray();
     }
 
     /**

@@ -14,3 +14,7 @@ Thumbs.db
 
 # 编译产物 JAR 通过 GitHub Releases 发布，不入库
 *.jar
+
+# 例外：gradle wrapper 的 jar 是构建工具的一部分，必须入库，
+# 否则别人 clone 下来 ./gradlew 直接跑不起来（旧规则把它一起忽略了）
+!gradle/wrapper/gradle-wrapper.jar

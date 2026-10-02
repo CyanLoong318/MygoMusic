@@ -19,6 +19,17 @@ import java.util.concurrent.locks.ReentrantLock;
 public class PlayQueue {
     private static final Logger logger = LoggerFactory.getLogger("MygoMusic-Queue");
 
+    /** 时长未知的歌曲：等这么久还没收到客户端「播完」信号就兜底切歌，防止队列永久停住 */
+    private static final long UNKNOWN_DURATION_FALLBACK_MS = 15 * 60 * 1000L;
+
+    /**
+     * 服务端定时器判定「已播完」时的宽容量(毫秒)。
+     * playbackStartTime 在 PLAY 广播前就起算，而客户端开音频设备 + 缓冲首帧还要 0.5~2 秒才真正出声；
+     * 不放宽的话定时器会抢在客户端播完前切歌，每首歌的结尾都被削掉一小截。
+     * 客户端自己的「播完」信号不受此影响（它到达时本来就晚于服务端时钟，且走严格判定直接放行）。
+     */
+    public static final long SERVER_CLOCK_GRACE_MS = 2000;
+
     private final LinkedList<QueueItem> queue = new LinkedList<>();
     private final LinkedList<QueueItem> history = new LinkedList<>();
     private final ReentrantLock lock = new ReentrantLock();
@@ -28,6 +39,12 @@ public class PlayQueue {
     private SongDetail currentSongDetail = null;
     private long playbackStartTime = 0;
     private boolean playing = false;
+
+    /**
+     * 播放代次：每换一首歌自增。随 PLAY 包下发给客户端，「已播完」回执原样带回，
+     * 服务端据此丢弃迟到的旧信号（否则某客户端为上一首发的完成包会把新歌停掉再跳一首）。
+     */
+    private long playbackId = 0;
 
     /** 全局暂停：暂停期间播放进度冻结（不会因时间流逝触发自动切歌/完成判定） */
     private volatile boolean paused = false;
@@ -264,8 +281,21 @@ public class PlayQueue {
             this.currentSongDetail = detail;
             this.playbackStartTime = System.currentTimeMillis();
             this.playing = true;
+            this.playbackId++; // 新的一首：代次+1，之前那首的「已播完」回执从此作废
             // 新歌开始 → 解除暂停（切歌即“继续播放新歌”）
             resetPauseState();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 当前播放代次（见 {@link #playbackId}）
+     */
+    public long getPlaybackId() {
+        lock.lock();
+        try {
+            return playbackId;
         } finally {
             lock.unlock();
         }
@@ -337,16 +367,34 @@ public class PlayQueue {
     }
 
     /**
-     * 检查歌曲是否播放完毕（基于有效播放时长，暂停期间不会“到点”）
+     * 检查歌曲是否播放完毕（基于有效播放时长，暂停期间不会“到点”）。严格判定，供客户端信号核对用。
      */
     public boolean isPlaybackFinished() {
+        return isPlaybackFinished(0);
+    }
+
+    /**
+     * 检查歌曲是否播放完毕。
+     *
+     * @param graceMs 额外宽容时间(毫秒)。服务端定时器用 {@link #SERVER_CLOCK_GRACE_MS}
+     *                （见其注释）；客户端「播完」信号核对传 0，保持严格。
+     */
+    public boolean isPlaybackFinished(long graceMs) {
         lock.lock();
         try {
             if (!playing || currentSongDetail == null) {
                 return false;
             }
+            long duration = currentSongDetail.getDuration();
+            // 时长未知（0 或负数）绝不能判成「已播完」：position(≥0) >= 0 恒成立，
+            // 结果就是这首歌刚开始就被判完成、tick 立刻再判下一首完成，整个队列一秒内刷到底。
+            // 未知时长一律交给客户端「播完」信号；只有长达 {@link #UNKNOWN_DURATION_FALLBACK_MS}
+            // 仍没有任何信号（例如玩家用原版客户端、根本没装 Mod）才兜底切歌，避免队列永久卡住。
+            if (duration <= 0) {
+                return effectiveElapsedMs(System.currentTimeMillis()) >= UNKNOWN_DURATION_FALLBACK_MS;
+            }
             long position = effectiveElapsedMs(System.currentTimeMillis());
-            return position >= currentSongDetail.getDuration();
+            return position >= duration + graceMs;
         } finally {
             lock.unlock();
         }

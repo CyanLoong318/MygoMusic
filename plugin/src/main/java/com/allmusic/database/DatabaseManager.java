@@ -22,6 +22,9 @@ public class DatabaseManager {
     private final ConfigManager configManager;
     private HikariDataSource dataSource;
     private boolean connected = false;
+    /** 是否 MySQL。方言差别很大（自增主键 / INSERT OR IGNORE / INSERT OR REPLACE / CREATE INDEX IF NOT EXISTS），
+     *  之前这些 SQLite 写法在 MySQL 上全都是语法错误，等于 config 里填 mysql 就直接不可用。 */
+    private boolean mysql = false;
 
     public DatabaseManager(JavaPlugin plugin, ConfigManager configManager) {
         this.plugin = plugin;
@@ -36,7 +39,8 @@ public class DatabaseManager {
             HikariConfig hikariConfig = new HikariConfig();
 
             String dbType = configManager.getDbType();
-            if (dbType.equalsIgnoreCase("mysql")) {
+            this.mysql = dbType.equalsIgnoreCase("mysql");
+            if (mysql) {
                 // MySQL 配置
                 hikariConfig.setJdbcUrl(String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=Asia/Shanghai",
                         configManager.getMysqlHost(),
@@ -52,7 +56,7 @@ public class DatabaseManager {
                 hikariConfig.setDriverClassName("org.sqlite.JDBC");
             }
 
-            hikariConfig.setMaximumPoolSize(dbType.equalsIgnoreCase("mysql") ? configManager.getMysqlPoolSize() : 1);
+            hikariConfig.setMaximumPoolSize(mysql ? configManager.getMysqlPoolSize() : 1);
             hikariConfig.setConnectionTimeout(10000);
             hikariConfig.setIdleTimeout(600000);
             hikariConfig.setMaxLifetime(1800000);
@@ -63,7 +67,7 @@ public class DatabaseManager {
             // 创建表
             createTables();
 
-            logger.info("数据库初始化成功 ({}:)", dbType);
+            logger.info("数据库初始化成功 ({})", dbType);
         } catch (Exception e) {
             logger.error("数据库初始化失败: " + e.getMessage(), e);
             connected = false;
@@ -74,55 +78,59 @@ public class DatabaseManager {
      * 创建表
      */
     private void createTables() {
+        // 自增主键写法两库不同
+        String pk = mysql ? "BIGINT AUTO_INCREMENT PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT";
+        // MySQL 不支持 CREATE INDEX IF NOT EXISTS，索引只能写在建表语句里
+        String historyKeys = mysql ? ", KEY idx_history_player (player_uuid), KEY idx_history_time (played_at)" : "";
+        String favoritesKeys = mysql ? ", KEY idx_favorites_player (player_uuid)" : "";
+
         try (Connection conn = dataSource.getConnection();
              Statement stmt = conn.createStatement()) {
 
             // 播放历史表
-            stmt.execute("""
-                CREATE TABLE IF NOT EXISTS play_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    player_uuid VARCHAR(36) NOT NULL,
-                    player_name VARCHAR(16) NOT NULL,
-                    song_source VARCHAR(16) NOT NULL,
-                    song_id VARCHAR(128) NOT NULL,
-                    song_title VARCHAR(256) NOT NULL,
-                    song_artist VARCHAR(256),
-                    played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """);
+            stmt.execute("CREATE TABLE IF NOT EXISTS play_history ("
+                    + "id " + pk + ", "
+                    + "player_uuid VARCHAR(36) NOT NULL, "
+                    + "player_name VARCHAR(16) NOT NULL, "
+                    + "song_source VARCHAR(16) NOT NULL, "
+                    + "song_id VARCHAR(128) NOT NULL, "
+                    + "song_title VARCHAR(256) NOT NULL, "
+                    + "song_artist VARCHAR(256), "
+                    + "played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                    + historyKeys
+                    + ")");
 
             // 收藏表
-            stmt.execute("""
-                CREATE TABLE IF NOT EXISTS favorites (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    player_uuid VARCHAR(36) NOT NULL,
-                    song_source VARCHAR(16) NOT NULL,
-                    song_id VARCHAR(128) NOT NULL,
-                    song_title VARCHAR(256) NOT NULL,
-                    song_artist VARCHAR(256),
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(player_uuid, song_source, song_id)
-                )
-            """);
+            stmt.execute("CREATE TABLE IF NOT EXISTS favorites ("
+                    + "id " + pk + ", "
+                    + "player_uuid VARCHAR(36) NOT NULL, "
+                    + "song_source VARCHAR(16) NOT NULL, "
+                    + "song_id VARCHAR(128) NOT NULL, "
+                    + "song_title VARCHAR(256) NOT NULL, "
+                    + "song_artist VARCHAR(256), "
+                    + "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                    + "UNIQUE(player_uuid, song_source, song_id)"
+                    + favoritesKeys
+                    + ")");
 
             // 账号表
-            stmt.execute("""
-                CREATE TABLE IF NOT EXISTS accounts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    player_uuid VARCHAR(36) NOT NULL,
-                    platform VARCHAR(16) NOT NULL,
-                    token_encrypted TEXT NOT NULL,
-                    expires_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(player_uuid, platform)
-                )
-            """);
+            stmt.execute("CREATE TABLE IF NOT EXISTS accounts ("
+                    + "id " + pk + ", "
+                    + "player_uuid VARCHAR(36) NOT NULL, "
+                    + "platform VARCHAR(16) NOT NULL, "
+                    + "token_encrypted TEXT NOT NULL, "
+                    + "expires_at TIMESTAMP, "
+                    + "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                    + "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                    + "UNIQUE(player_uuid, platform)"
+                    + ")");
 
-            // 创建索引
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_history_player ON play_history(player_uuid)");
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_history_time ON play_history(played_at)");
-            stmt.execute("CREATE INDEX IF NOT EXISTS idx_favorites_player ON favorites(player_uuid)");
+            // SQLite 的索引单独建（MySQL 已写在建表语句里）
+            if (!mysql) {
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_history_player ON play_history(player_uuid)");
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_history_time ON play_history(played_at)");
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_favorites_player ON favorites(player_uuid)");
+            }
 
         } catch (SQLException e) {
             logger.error("创建表失败: " + e.getMessage(), e);
@@ -158,9 +166,11 @@ public class DatabaseManager {
     public boolean addFavorite(UUID playerUuid, SongInfo song) {
         if (!connected) return false;
 
+        String sql = mysql
+                ? "INSERT IGNORE INTO favorites (player_uuid, song_source, song_id, song_title, song_artist) VALUES (?, ?, ?, ?, ?)"
+                : "INSERT OR IGNORE INTO favorites (player_uuid, song_source, song_id, song_title, song_artist) VALUES (?, ?, ?, ?, ?)";
         try (Connection conn = dataSource.getConnection();
-             PreparedStatement stmt = conn.prepareStatement(
-                     "INSERT OR IGNORE INTO favorites (player_uuid, song_source, song_id, song_title, song_artist) VALUES (?, ?, ?, ?, ?)")) {
+             PreparedStatement stmt = conn.prepareStatement(sql)) {
 
             stmt.setString(1, playerUuid.toString());
             stmt.setString(2, song.getSource());
@@ -181,9 +191,12 @@ public class DatabaseManager {
     public void saveAccount(UUID playerUuid, String platform, String encryptedToken) {
         if (!connected) return;
 
+        String sql = mysql
+                ? "INSERT INTO accounts (player_uuid, platform, token_encrypted, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)"
+                        + " ON DUPLICATE KEY UPDATE token_encrypted = VALUES(token_encrypted), updated_at = CURRENT_TIMESTAMP"
+                : "INSERT OR REPLACE INTO accounts (player_uuid, platform, token_encrypted, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)";
         try (Connection conn = dataSource.getConnection();
-             PreparedStatement stmt = conn.prepareStatement(
-                     "INSERT OR REPLACE INTO accounts (player_uuid, platform, token_encrypted, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)")) {
+             PreparedStatement stmt = conn.prepareStatement(sql)) {
 
             stmt.setString(1, playerUuid.toString());
             stmt.setString(2, platform);

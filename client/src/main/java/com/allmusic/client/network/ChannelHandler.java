@@ -2,6 +2,7 @@ package com.allmusic.client.network;
 
 import com.allmusic.client.AllMusicClient;
 import com.allmusic.client.audio.AudioPlayer;
+import com.allmusic.client.config.ClientConfig;
 import com.allmusic.client.gui.QueueState;
 import com.allmusic.client.gui.SearchScreen;
 import com.allmusic.client.lyrics.LyricsRenderer;
@@ -33,6 +34,8 @@ public class ChannelHandler {
     private static final byte PACKET_RESUME = 0x04;
     private static final byte PACKET_VOLUME = 0x05;
     private static final byte PACKET_SYNC = 0x06;
+    // 服务端 → 客户端：歌词显示开关（/mm lyrics）
+    private static final byte PACKET_LYRICS = 0x07;
     private static final byte PACKET_QUEUE_SYNC = 0x08;
     private static final byte PACKET_SEARCH_RESULT = 0x09;
     // 客户端 → 服务端：当前歌曲已播放完毕（自动请求下一首）
@@ -41,6 +44,8 @@ public class ChannelHandler {
     private static final byte PACKET_CACHE_CONFIG = 0x0D;
     // 客户端 → 服务端：请求一次队列状态同步（GUI 打开时主动拉取播放/暂停状态）
     public static final byte PACKET_REQUEST_SYNC = 0x0E;
+    // 服务端 → 客户端：设置客户端音量（/mm volume）
+    private static final byte PACKET_SET_VOLUME = 0x0F;
 
     private final AllMusicClient clientMod;
 
@@ -76,10 +81,17 @@ public class ChannelHandler {
     }
 
     /**
-     * 通知服务端当前歌曲已播放完（自动请求下一首）
+     * 通知服务端当前歌曲已播放完（自动请求下一首）。
+     *
+     * @param playbackId 播放本首歌时服务端下发的代次，原样带回。服务端据此判断这条回执说的是
+     *                   哪一首歌 —— 迟到的回执（全服已切到下一首）会被丢弃，不会把新歌切掉。
      */
-    public static void notifySongFinished() {
-        sendToServer(new byte[]{PACKET_SONGFINISHED});
+    public static void notifySongFinished(long playbackId) {
+        byte[] data = java.nio.ByteBuffer.allocate(9)
+                .put(PACKET_SONGFINISHED)
+                .putLong(playbackId) // 大端，与服务端 ByteArrayDataInput.readLong() 一致
+                .array();
+        sendToServer(data);
     }
 
     /**
@@ -99,15 +111,20 @@ public class ChannelHandler {
             byte packetType = data[0];
 
             switch (packetType) {
-                case PACKET_PLAY:
-                    handlePlay(data, client);
-                    // #5 单P BV搜索自动播放时，关闭搜索界面
-                    client.execute(() -> {
-                        if (client.currentScreen instanceof SearchScreen) {
-                            client.setScreen(null);
-                        }
-                    });
+                case PACKET_PLAY: {
+                    String playingSongId = handlePlay(data, client);
+                    // PLAY 是广播包：只有「本机刚点的那首」回执才关搜索界面。
+                    // 旧行为是无条件关闭 —— 别人点歌会把正在搜索的人直接踢出界面（输入到一半的关键词也没了）。
+                    // 用 songId 核对（曲名会重名，B站分P的曲名还与详情页不同）。
+                    if (SearchScreen.consumeExpected(playingSongId)) {
+                        client.execute(() -> {
+                            if (client.currentScreen instanceof SearchScreen) {
+                                client.setScreen(null);
+                            }
+                        });
+                    }
                     break;
+                }
                 case PACKET_STOP:
                     handleStop(client);
                     break;
@@ -126,6 +143,12 @@ public class ChannelHandler {
                 case PACKET_CACHE_CONFIG:
                     handleCacheConfig(data, client);
                     break;
+                case PACKET_SET_VOLUME:
+                    handleSetVolume(data, client);
+                    break;
+                case PACKET_LYRICS:
+                    handleLyricsToggle(data, client);
+                    break;
                 default:
                     logger.warn("未知的包类型: {}", packetType);
             }
@@ -136,8 +159,10 @@ public class ChannelHandler {
 
     /**
      * 处理播放包
+     *
+     * @return 服务端侧歌曲 ID（供调用方判断「是不是本机刚点的那首」）；解析失败返回 null
      */
-    private void handlePlay(byte[] data, MinecraftClient client) {
+    private String handlePlay(byte[] data, MinecraftClient client) {
         try {
             int offset = 1;
 
@@ -184,6 +209,12 @@ public class ChannelHandler {
                 lyrics.add(new LyricsRenderer.LyricsLine(timestamp, text, translation));
             }
 
+            // 追加字段（老服务端不发这些字节，长度不足时用默认值；见服务端 buildPlayData）
+            final int extraLen = data.length - offset;
+            final long playbackId = extraLen >= 8 ? readLong(data, offset) : -1L;
+            final boolean joinInProgress = extraLen >= 9 && data[offset + 8] != 0;
+            final String songId = extraLen >= 10 ? readString(data, offset + 9) : "";
+
             // 确定播放URL
             String playUrl = (localPath != null && !localPath.isEmpty()) ? localPath : audioUrl;
             final boolean finalHasTranslation = hasTranslation;
@@ -198,14 +229,16 @@ public class ChannelHandler {
 
                 // 播放音频
                 if (playUrl != null && !playUrl.isEmpty()) {
-                    audioPlayer.play(playUrl, title, artist, duration, source);
-                    logger.info("开始播放: {} - {}", title, artist);
+                    audioPlayer.play(playUrl, title, artist, duration, source, playbackId, joinInProgress);
+                    logger.info("开始播放: {} - {}{}", title, artist, joinInProgress ? "（中途加入）" : "");
                 } else {
                     logger.warn("没有可用的播放URL");
                 }
             });
+            return songId;
         } catch (Exception e) {
             logger.error("处理播放包失败: " + e.getMessage(), e);
+            return null;
         }
     }
 
@@ -374,6 +407,42 @@ public class ChannelHandler {
             });
         } catch (Exception e) {
             logger.error("处理缓存设置包失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 处理服务端下发的音量设置 (0x0F: volume(4))
+     */
+    private void handleSetVolume(byte[] data, MinecraftClient client) {
+        try {
+            int volume = readInt(data, 1);
+            client.execute(() -> {
+                AudioPlayer audioPlayer = clientMod.getAudioPlayer();
+                if (audioPlayer != null) {
+                    audioPlayer.setVolume(volume);
+                    logger.info("音量已由服务端设置为: {}", volume);
+                }
+            });
+        } catch (Exception e) {
+            logger.error("处理音量设置包失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 处理服务端下发的歌词开关 (0x07: mode(1)，0=切换 1=显示 2=隐藏)
+     */
+    private void handleLyricsToggle(byte[] data, MinecraftClient client) {
+        try {
+            int mode = data.length > 1 ? (data[1] & 0xFF) : 0;
+            client.execute(() -> {
+                ClientConfig config = clientMod.getConfig();
+                boolean show = mode == 1 || (mode != 2 && !config.isLyricsEnabled());
+                config.setLyricsEnabled(show);
+                config.save();
+                logger.info("歌词显示已{}", show ? "开启" : "关闭");
+            });
+        } catch (Exception e) {
+            logger.error("处理歌词开关包失败: " + e.getMessage(), e);
         }
     }
 

@@ -8,7 +8,9 @@ import java.io.*;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -20,6 +22,15 @@ import java.util.Map;
  */
 public class AudioCache {
     private static final Logger logger = LoggerFactory.getLogger("MygoMusic-Cache");
+
+    /** 小于此字节数的缓存文件一律视为垃圾/碎片，不作为有效缓存使用（正常歌曲远大于此） */
+    private static final long MIN_VALID_BYTES = 16 * 1024;
+
+    /** 下载中的临时文件后缀：只有 commit() 成功改名后才算正式缓存 */
+    private static final String PART_SUFFIX = ".part";
+
+    /** 超过这么久没有新写入的 .part 视为崩溃/断电残留（进行中的下载会持续刷新修改时间），允许清理 */
+    private static final long STALE_PART_MS = 6 * 60 * 60 * 1000L;
 
     private final File cacheDir;
     private volatile int maxSizeMB;
@@ -44,10 +55,15 @@ public class AudioCache {
         if (url == null || url.isEmpty()) return null;
         File file = new File(cacheDir, hashUrl(url) + ".mp3");
 
-        if (file.exists() && file.length() > 0) {
+        if (file.exists() && file.length() >= MIN_VALID_BYTES) {
             // 更新访问时间
             file.setLastModified(System.currentTimeMillis());
             return file;
+        }
+        // 过小的文件必然是截断产物（正常歌曲至少几百 KB），删掉并重新下载
+        if (file.exists()) {
+            logger.warn("缓存文件过小({} 字节)，已丢弃: {}", file.length(), file.getName());
+            file.delete();
         }
 
         return null;
@@ -68,8 +84,8 @@ public class AudioCache {
             }
         }
 
-        // 检查缓存大小
-        cleanCache();
+        // 检查缓存大小（刚存好的这份不参与清理）
+        cleanCache(file);
 
         return file;
     }
@@ -96,10 +112,12 @@ public class AudioCache {
         private final File finalFile;
         private final OutputStream out;
         private boolean closed = false;
+        /** 写入过程中出过错（磁盘满/IO异常）：即使字节数够，也不能让这个文件变成正式缓存 */
+        private volatile boolean writeFailed = false;
 
         private CacheWriter(File finalFile) throws IOException {
             this.finalFile = finalFile;
-            this.partFile = new File(finalFile.getParentFile(), finalFile.getName() + ".part");
+            this.partFile = new File(finalFile.getParentFile(), finalFile.getName() + PART_SUFFIX);
             this.out = new BufferedOutputStream(new FileOutputStream(partFile), 64 * 1024);
         }
 
@@ -109,7 +127,9 @@ public class AudioCache {
             try {
                 out.write(buf, off, len);
             } catch (IOException e) {
-                logger.warn("写缓存失败: {}", e.getMessage());
+                // 记下来：写失败但继续写下去，最终会得到一个「长度看着正常、内容却缺一段」的坏文件
+                writeFailed = true;
+                logger.warn("写缓存失败(该文件将不会入库): {}", e.getMessage());
             }
         }
 
@@ -119,20 +139,28 @@ public class AudioCache {
             closed = true;
             try {
                 out.close();
-                if (partFile.length() > 0) {
-                    if (finalFile.exists()) finalFile.delete();
-                    if (!partFile.renameTo(finalFile)) {
-                        logger.warn("缓存改名失败: {}", finalFile.getName());
-                        partFile.delete();
-                    } else {
-                        cleanCache();
-                    }
-                } else {
-                    partFile.delete();
-                }
             } catch (IOException e) {
+                writeFailed = true;
                 logger.warn("缓存落盘失败: {}", e.getMessage());
+            }
+
+            if (writeFailed) {
+                logger.warn("缓存写入期间出错，丢弃: {}", finalFile.getName());
                 partFile.delete();
+                return;
+            }
+
+            if (partFile.length() <= 0) {
+                partFile.delete();
+                return;
+            }
+
+            if (finalFile.exists()) finalFile.delete();
+            if (!partFile.renameTo(finalFile)) {
+                logger.warn("缓存改名失败: {}", finalFile.getName());
+                partFile.delete();
+            } else {
+                cleanCache(finalFile);
             }
         }
 
@@ -148,31 +176,46 @@ public class AudioCache {
     }
 
     /**
-     * 清理缓存
+     * 清理缓存：删到上限的 80%。
+     *
+     * @param keep 刚写入完成的文件，计入体积但不删（否则一首歌刚缓存好就可能被这次清理删掉，
+     *             下次播放又要重下）；可为 null
      */
-    private void cleanCache() {
+    private void cleanCache(File keep) {
         File[] files = cacheDir.listFiles();
         if (files == null) return;
 
+        // .part 是正在写的临时文件：不计入总体积、也不参与容量清理 ——
+        // 删掉它会让那次下载最后的 renameTo 失败（日志里的「缓存改名失败」），白下一整首。
+        // 但崩溃/断电残留的孤儿 .part（长时间没有新写入）会既占磁盘又永不被清，这里按「久未更新」兜底清掉。
+        List<File> deletable = new ArrayList<>();
         long totalSize = 0;
+        long now = System.currentTimeMillis();
         for (File file : files) {
+            if (file.getName().endsWith(PART_SUFFIX)) {
+                if (now - file.lastModified() > STALE_PART_MS && file.delete()) {
+                    logger.info("清理残留未完成缓存: {}", file.getName());
+                }
+                continue;
+            }
             totalSize += file.length();
+            if (keep == null || !file.equals(keep)) {
+                deletable.add(file);
+            }
         }
 
         long maxSizeBytes = (long) maxSizeMB * 1024 * 1024;
+        if (totalSize <= maxSizeBytes) return;
 
-        if (totalSize > maxSizeBytes) {
-            // 按修改时间排序，删除最旧的文件
-            java.util.Arrays.sort(files, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
+        // 按修改时间排序，删除最旧的文件
+        deletable.sort((a, b) -> Long.compare(a.lastModified(), b.lastModified()));
+        for (File file : deletable) {
+            if (totalSize <= maxSizeBytes * 0.8) break;
 
-            for (File file : files) {
-                if (totalSize <= maxSizeBytes * 0.8) break;
-
-                long fileSize = file.length();
-                if (file.delete()) {
-                    totalSize -= fileSize;
-                    logger.info("清理缓存文件: {}", file.getName());
-                }
+            long fileSize = file.length();
+            if (file.delete()) {
+                totalSize -= fileSize;
+                logger.info("清理缓存文件: {}", file.getName());
             }
         }
     }

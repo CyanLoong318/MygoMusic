@@ -113,27 +113,32 @@ public class KugouSource implements MusicSource {
         List<SongInfo> results = new ArrayList<>();
         try {
             long clienttime = System.currentTimeMillis() / 1000;
-            String url = "https://complexsearch.kugou.com/v2/search/song"
-                    + "?callback=callback123"
-                    + "&srcappid=2919"
-                    + "&clientver=1000"
-                    + "&clienttime=" + clienttime
-                    + "&mid=" + clienttime
-                    + "&uuid=" + clienttime
-                    + "&dfid=-"
-                    + "&keyword=" + keyword
-                    + "&page=1"
-                    + "&pagesize=" + limit
-                    + "&bitrate=0"
-                    + "&isfuzzy=0"
-                    + "&inputtype=0"
-                    + "&platform=WebFilter"
-                    + "&userid=0"
-                    + "&iscorrection=1"
-                    + "&privilege_filter=0"
-                    + "&filter=10"
-                    + "&token="
-                    + "&appid=1014";
+            // complexsearch 同样要签名，否则服务端直接按未授权拒掉。
+            // 旧实现少了 signature，等于每次搜索都先白发一个必定失败的请求，再回退 V1。
+            Map<String, String> params = new HashMap<>();
+            params.put("callback", "callback123");
+            params.put("srcappid", "2919");
+            params.put("clientver", "1000");
+            params.put("clienttime", String.valueOf(clienttime));
+            params.put("mid", String.valueOf(clienttime));
+            params.put("uuid", String.valueOf(clienttime));
+            params.put("dfid", "-");
+            params.put("keyword", keyword);
+            params.put("page", "1");
+            params.put("pagesize", String.valueOf(limit));
+            params.put("bitrate", "0");
+            params.put("isfuzzy", "0");
+            params.put("inputtype", "0");
+            params.put("platform", "WebFilter");
+            params.put("userid", "0");
+            params.put("iscorrection", "1");
+            params.put("privilege_filter", "0");
+            params.put("filter", "10");
+            params.put("token", "");
+            params.put("appid", "1014");
+
+            // buildSignedQuery 内部先算签名再做 URL 编码（关键词里的中文/&/# 直接拼会破坏查询串）
+            String url = "https://complexsearch.kugou.com/v2/search/song?" + buildSignedQuery(params);
 
             Map<String, String> headers = getHeaders();
             headers.put("Referer", "https://complexsearch.kugou.com/");
@@ -170,7 +175,7 @@ public class KugouSource implements MusicSource {
         List<SongInfo> results = new ArrayList<>();
         try {
             String url = "https://songsearch.kugou.com/song_search_v2"
-                    + "?keyword=" + keyword
+                    + "?keyword=" + URLEncoder.encode(keyword, "UTF-8")
                     + "&page=1"
                     + "&pagesize=" + limit
                     + "&userid=0"
@@ -866,32 +871,51 @@ public class KugouSource implements MusicSource {
         return v;
     }
 
+    /** LRC 一行：开头可能连着写多个时间戳（副歌重复），后面才是歌词文本 */
+    private static final Pattern LRC_LINE_PATTERN =
+            Pattern.compile("^((?:\\[\\d{1,3}:\\d{1,2}(?:[.:]\\d{1,3})?\\])+)(.*)$");
+    /** 从上面那串时间戳里逐个取出 [分:秒.毫秒] */
+    private static final Pattern LRC_TIME_PATTERN =
+            Pattern.compile("\\[(\\d{1,3}):(\\d{1,2})(?:[.:](\\d{1,3}))?\\]");
+
     /**
-     * 解析LRC歌词
+     * 解析LRC歌词。与网易云的解析保持一致：
+     * 一行上的每个时间戳都要收（形如 [00:12.34][01:20.56]同一句副歌），
+     * 且兼容 [00:12]（无小数秒）写法。旧实现 find() 只取第一个时间戳、
+     * 且强制要求小数秒，副歌第二遍会丢、无小数行会整行被丢。
      */
     private Lyrics parseLrc(String lrcText) {
-        List<LyricsLine> lines = new ArrayList<>();
-        Pattern pattern = Pattern.compile("\\[(\\d{2}):(\\d{2})\\.(\\d{2,3})\\](.*)");
+        Map<Long, String> collected = new HashMap<>();
+        for (String rawLine : lrcText.split("\n")) {
+            Matcher lineMatcher = LRC_LINE_PATTERN.matcher(rawLine.trim());
+            if (!lineMatcher.matches()) continue;
 
-        for (String line : lrcText.split("\n")) {
-            Matcher matcher = pattern.matcher(line.trim());
-            if (matcher.find()) {
-                long minutes = Long.parseLong(matcher.group(1));
-                long seconds = Long.parseLong(matcher.group(2));
-                long millis = Long.parseLong(matcher.group(3));
-                if (matcher.group(3).length() == 2) millis *= 10;
+            String text = lineMatcher.group(2).trim();
+            if (text.isEmpty()) continue; // 纯时间戳行（空行/元信息），不产生歌词
 
-                long timestamp = minutes * 60 * 1000 + seconds * 1000 + millis;
-                String text = matcher.group(4).trim();
-
-                if (!text.isEmpty()) {
-                    lines.add(new LyricsLine(timestamp, text, null));
-                }
+            Matcher timeMatcher = LRC_TIME_PATTERN.matcher(lineMatcher.group(1));
+            while (timeMatcher.find()) {
+                collected.put(lrcTimestamp(timeMatcher.group(1), timeMatcher.group(2), timeMatcher.group(3)), text);
             }
         }
 
+        List<LyricsLine> lines = new ArrayList<>(collected.size());
+        for (Map.Entry<Long, String> entry : collected.entrySet()) {
+            lines.add(new LyricsLine(entry.getKey(), entry.getValue(), null));
+        }
         lines.sort((a, b) -> Long.compare(a.getTimestamp(), b.getTimestamp()));
         return new Lyrics(lines, lrcText, false);
+    }
+
+    /** 时间戳转毫秒。毫秒位可能是 1/2/3 位：2 位按 10ms 计，1 位按 100ms 计（与网易云一致） */
+    private static long lrcTimestamp(String minutes, String seconds, String fraction) {
+        long millis = 0;
+        if (fraction != null && !fraction.isEmpty()) {
+            millis = Long.parseLong(fraction);
+            if (fraction.length() == 2) millis *= 10;
+            else if (fraction.length() == 1) millis *= 100;
+        }
+        return Long.parseLong(minutes) * 60_000L + Long.parseLong(seconds) * 1000L + millis;
     }
 
     /**
@@ -1040,23 +1064,15 @@ public class KugouSource implements MusicSource {
             params.put("uuid", "-");
             params.put("dfid", "-");
 
-            // 计算 Web 签名
-            String signature = generateWebSignature(params);
-            params.put("signature", signature);
-
-            // 构建 URL
-            StringBuilder urlBuilder = new StringBuilder("https://login-user.kugou.com/v2/qrcode?");
-            boolean first = true;
-            for (Map.Entry<String, String> entry : params.entrySet()) {
-                if (!first) urlBuilder.append("&");
-                urlBuilder.append(entry.getKey()).append("=").append(entry.getValue());
-                first = false;
-            }
+            // 构建 URL：必须走 buildSignedQuery（内部先签名再 URL 编码）。
+            // qrcode_txt 的值本身是一条带 ? 和 & 的 URL，直接拼进查询串会把参数截断，
+            // 服务端只收到半截 qrcode_txt，二维码就永远生成不出来。
+            String url = "https://login-user.kugou.com/v2/qrcode?" + buildSignedQuery(params);
 
             Map<String, String> headers = getHeaders();
             headers.put("Referer", "https://h5.kugou.com/");
 
-            String response = HttpUtil.get(urlBuilder.toString(), headers);
+            String response = HttpUtil.get(url, headers);
             JsonObject json = parseResponseSafe(response);
             if (json == null) {
                 logger.warn("酷狗二维码生成失败: 解析响应失败");
@@ -1108,23 +1124,13 @@ public class KugouSource implements MusicSource {
                 params.put("uuid", "-");
                 params.put("dfid", "-");
 
-                // 计算 Web 签名
-                String signature = generateWebSignature(params);
-                params.put("signature", signature);
-
-                // 构建 URL
-                StringBuilder urlBuilder = new StringBuilder("https://login-user.kugou.com/v2/get_userinfo_qrcode?");
-                boolean first = true;
-                for (Map.Entry<String, String> entry : params.entrySet()) {
-                    if (!first) urlBuilder.append("&");
-                    urlBuilder.append(entry.getKey()).append("=").append(entry.getValue());
-                    first = false;
-                }
+                // 构建 URL：同 loginWithQrCode，统一走带编码的签名查询串
+                String url = "https://login-user.kugou.com/v2/get_userinfo_qrcode?" + buildSignedQuery(params);
 
                 Map<String, String> headers = getHeaders();
                 headers.put("Referer", "https://h5.kugou.com/");
 
-                String response = HttpUtil.get(urlBuilder.toString(), headers);
+                String response = HttpUtil.get(url, headers);
                 JsonObject json = parseResponseSafe(response);
                 if (json == null) continue;
 
